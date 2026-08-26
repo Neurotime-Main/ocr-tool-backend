@@ -1,0 +1,75 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum OcrStatus {
+  PENDING
+  PROCESSING
+  COMPLETE
+  FAILED
+}
+
+enum HighlightSource {
+  AUTO
+  MANUAL
+}
+
+model Document {
+  id           String      @id @default(cuid())
+  originalName String
+  storageKey   String      @unique
+  mimeType     String      @default("application/pdf")
+  size         Int
+  pageCount    Int?
+  ocrStatus    OcrStatus   @default(PENDING)
+  ocrLanguage  String      @default("eng")
+  ocrMode      String      @default("AUTO")
+  ocrError     String?
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+  pages        OcrPage[]
+  highlights   Highlight[]
+}
+
+model OcrPage {
+  id         String   @id @default(cuid())
+  documentId String
+  pageNumber Int
+  width      Float
+  height     Float
+  source     String
+  text       String   @db.Text
+  words      Json
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@unique([documentId, pageNumber])
+  @@index([documentId])
+}
+
+model Highlight {
+  id         String          @id @default(cuid())
+  documentId String
+  pageNumber Int
+  x          Float
+  y          Float
+  width      Float
+  height     Float
+  color      String          @default("#FDE047")
+  opacity    Float           @default(0.38)
+  source     HighlightSource
+  keyword    String?
+  note       String?
+  createdAt  DateTime        @default(now())
+  updatedAt  DateTime        @updatedAt
+  document   Document        @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([documentId, pageNumber])
+}

@@ -1,0 +1,34 @@
+services:
+  - type: web
+    name: markwise-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    maxShutdownDelaySeconds: 120
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: STORAGE_DRIVER
+        value: s3
+      - key: DATABASE_URL
+        sync: false
+      - key: DIRECT_URL
+        sync: false
+      - key: CLIENT_ORIGIN
+        sync: false
+      - key: AWS_REGION
+        sync: false
+      - key: AWS_S3_BUCKET
+        sync: false
+      - key: AWS_S3_PREFIX
+        value: documents
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      # Leave OCR_CONCURRENCY unset to size the recognition pool from the
+      # instance's CPU count. Set it only to cap memory on a small plan.
+      - key: UPLOAD_STORAGE_CONCURRENCY
+        value: 4
+      - key: MAX_BATCH_FILES
+        value: 30
