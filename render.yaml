@@ -36,20 +36,36 @@ services:
       - key: CLIENT_ORIGIN
         sync: false
 
-      # --- S3 ---------------------------------------------------------------
-      # Render's disk is ephemeral, so uploaded PDFs must live in S3.
+      # --- Object storage (DigitalOcean Spaces, ams3) ------------------------
+      # Render's disk is ephemeral, so uploaded PDFs must live in object
+      # storage. The AWS SDK is the client because Spaces speaks the S3
+      # protocol, but nothing here is AWS and no AWS account is involved.
       - key: STORAGE_DRIVER
-        value: s3
-      - key: AWS_S3_BUCKET
+        value: spaces
+      # The Space name on its own, with no region and no URL.
+      - key: DO_SPACES_BUCKET
         sync: false
-      # Match the bucket to the database: eu-central-1.
-      - key: AWS_REGION
+      # What selects Spaces. Without it the SDK resolves an amazonaws.com host
+      # and 'ams3' signs against nothing, so every call fails.
+      - key: DO_SPACES_ENDPOINT
+        value: https://ams3.digitaloceanspaces.com
+      # Amsterdam. Used only for signing, but it must match the endpoint host.
+      - key: DO_SPACES_REGION
+        value: ams3
+      - key: DO_SPACES_FORCE_PATH_STYLE
+        value: true
+      # The SDK frames PutObject as 'aws-chunked' to append a trailing
+      # checksum, which Spaces rejects. Both flags default to the Spaces-safe
+      # setting in config.ts; they are spelled out here so the behaviour is
+      # visible on the service rather than implied.
+      - key: DO_SPACES_DISABLE_CHECKSUMS
+        value: true
+      # Spaces access key and secret, not AWS IAM credentials.
+      - key: DO_SPACES_KEY
         sync: false
-      - key: AWS_ACCESS_KEY_ID
+      - key: DO_SPACES_SECRET
         sync: false
-      - key: AWS_SECRET_ACCESS_KEY
-        sync: false
-      - key: AWS_S3_PREFIX
+      - key: DO_SPACES_PREFIX
         value: documents
 
       # --- Uploads ----------------------------------------------------------

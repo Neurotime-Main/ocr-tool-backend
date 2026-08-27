@@ -8,7 +8,7 @@ import {
   DeleteObjectCommand, GetObjectCommand, HeadObjectCommand, PutObjectCommand, S3Client,
 } from '@aws-sdk/client-s3';
 import { NodeHttpHandler } from '@smithy/node-http-handler';
-import { config } from './config.js';
+import { config, isSpacesDriver } from './config.js';
 
 export type StorageStatus = { driver: string; ok: boolean; detail: string };
 
@@ -45,7 +45,7 @@ export class LocalFileStorage implements FileStorage {
     // first, naming a path that says nothing about the cause.
     await access(source).catch(() => {
       throw new Error(
-        'The stored PDF is missing. A local storage directory is erased when the host restarts or redeploys; set STORAGE_DRIVER=s3 so uploads outlive a deploy.',
+        'The stored PDF is missing. A local storage directory is erased when the host restarts or redeploys; set STORAGE_DRIVER=spaces so uploads outlive a deploy.',
       );
     });
     return source;
@@ -69,7 +69,7 @@ export class LocalFileStorage implements FileStorage {
   }
 }
 
-export class S3FileStorage implements FileStorage {
+export class SpacesFileStorage implements FileStorage {
   private readonly client: S3Client;
 
   constructor(
@@ -77,28 +77,29 @@ export class S3FileStorage implements FileStorage {
     private readonly prefix: string,
   ) {
     this.client = new S3Client({
-      region: config.s3.region,
-      endpoint: config.s3.endpoint,
-      forcePathStyle: config.s3.forcePathStyle,
-      // Static keys are the only credential source on Render. Passing them
-      // explicitly turns a typo into an immediate, obvious failure instead of
-      // a slow fallback through the IMDS provider chain.
-      ...(config.s3.accessKeyId && config.s3.secretAccessKey
+      region: config.spaces.region,
+      // Spaces is only reachable through its own endpoint; without this the
+      // SDK builds an amazonaws.com hostname and never contacts DigitalOcean.
+      endpoint: config.spaces.endpoint,
+      forcePathStyle: config.spaces.forcePathStyle,
+      // A Spaces key pair is the only credential source: there is no metadata
+      // service to fall back to, so passing the keys explicitly turns a typo
+      // into an immediate failure rather than a slow provider-chain timeout.
+      ...(config.spaces.accessKeyId && config.spaces.secretAccessKey
         ? {
           credentials: {
-            accessKeyId: config.s3.accessKeyId,
-            secretAccessKey: config.s3.secretAccessKey,
-            ...(config.s3.sessionToken ? { sessionToken: config.s3.sessionToken } : {}),
+            accessKeyId: config.spaces.accessKeyId,
+            secretAccessKey: config.spaces.secretAccessKey,
           },
         }
         : {}),
-      maxAttempts: config.s3.maxAttempts,
-      ...(config.s3.disableChecksums ? { requestChecksumCalculation: 'WHEN_REQUIRED' as const } : {}),
+      maxAttempts: config.spaces.maxAttempts,
+      ...(config.spaces.disableChecksums ? { requestChecksumCalculation: 'WHEN_REQUIRED' as const } : {}),
       // Without these, a stalled connection would hold an OCR slot until the
       // platform kills the request.
       requestHandler: new NodeHttpHandler({
-        connectionTimeout: config.s3.connectionTimeoutMs,
-        requestTimeout: config.s3.requestTimeoutMs,
+        connectionTimeout: config.spaces.connectionTimeoutMs,
+        requestTimeout: config.spaces.requestTimeoutMs,
       }),
     });
   }
@@ -115,11 +116,15 @@ export class S3FileStorage implements FileStorage {
         Bucket: this.bucket,
         Key: key,
         Body: createReadStream(tempPath),
-        // S3 rejects a streamed body without a length. The AWS SDK can only
+        // Spaces rejects a streamed body without a length, and the SDK can only
         // infer one for buffers, so uploads fail intermittently without this.
         ContentLength: size,
         ContentType: 'application/pdf',
-        ServerSideEncryption: 'AES256',
+        // Spaces encrypts at rest by itself and rejects the SSE header, so it
+        // is sent only where these variables point at a store that wants one.
+        ...(config.spaces.serverSideEncryption
+          ? { ServerSideEncryption: config.spaces.serverSideEncryption as 'AES256' }
+          : {}),
       }));
       return key;
     } finally {
@@ -129,7 +134,7 @@ export class S3FileStorage implements FileStorage {
 
   async createReadStream(key: string) {
     const result = await this.client.send(new GetObjectCommand({ Bucket: this.bucket, Key: key }));
-    if (!result.Body) throw new Error('S3 returned an empty document body.');
+    if (!result.Body) throw new Error('Spaces returned an empty document body.');
     return result.Body as Readable;
   }
 
@@ -151,34 +156,33 @@ export class S3FileStorage implements FileStorage {
   }
 
   async check(): Promise<StorageStatus> {
-    // HeadObject on a key that does not exist is enough to prove the bucket,
-    // region, and credentials work, and it needs only the s3:GetObject
-    // permission that the service already requires. HeadBucket would demand a
-    // broader policy than the documented least-privilege one.
+    // HeadObject on a key that does not exist is enough to prove the Space,
+    // region, and credentials work, and it needs only read permission.
+    // HeadBucket would demand a broader grant than the service otherwise uses.
     try {
       await this.client.send(new HeadObjectCommand({
         Bucket: this.bucket,
         Key: `${this.prefix ? `${this.prefix}/` : ''}.markwise-health-probe`,
       }));
-      return { driver: 's3', ok: true, detail: this.bucket };
+      return { driver: 'spaces', ok: true, detail: this.bucket };
     } catch (error) {
       const name = (error as { name?: string }).name;
       // "Not found" is the expected answer and proves the round trip worked.
       if (name === 'NotFound' || name === 'NoSuchKey') {
-        return { driver: 's3', ok: true, detail: this.bucket };
+        return { driver: 'spaces', ok: true, detail: this.bucket };
       }
-      return { driver: 's3', ok: false, detail: `${name ?? 'Error'}: ${(error as Error).message}` };
+      return { driver: 'spaces', ok: false, detail: `${name ?? 'Error'}: ${(error as Error).message}` };
     }
   }
 }
 
 function createStorage(): FileStorage {
-  if (config.storageDriver === 's3') {
-    if (!config.s3.bucket) throw new Error('AWS_S3_BUCKET is required when STORAGE_DRIVER=s3.');
-    return new S3FileStorage(config.s3.bucket, config.s3.prefix);
+  if (isSpacesDriver(config.storageDriver)) {
+    if (!config.spaces.bucket) throw new Error('DO_SPACES_BUCKET is required when STORAGE_DRIVER=spaces.');
+    return new SpacesFileStorage(config.spaces.bucket, config.spaces.prefix);
   }
   if (config.storageDriver === 'local') return new LocalFileStorage(config.storageDir);
-  throw new Error(`Unsupported STORAGE_DRIVER: ${config.storageDriver}. Use 'local' or 's3'.`);
+  throw new Error(`Unsupported STORAGE_DRIVER: ${config.storageDriver}. Use 'local' or 'spaces'.`);
 }
 
 export const storage = createStorage();

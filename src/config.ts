@@ -12,6 +12,9 @@ const baseDir = process.cwd();
 // from a repository parent directory or a process manager.
 dotenv.config({ path: path.resolve(moduleDir, '../.env'), quiet: true });
 
+/** `s3` remains accepted so a service configured before the rename still boots. */
+export const isSpacesDriver = (driver: string | undefined) => driver === 'spaces' || driver === 's3';
+
 /**
  * Fails the process at boot with an actionable message rather than letting a
  * misconfigured deploy surface as a Prisma or AWS SDK error on the first
@@ -24,20 +27,17 @@ export function assertRuntimeEnvironment() {
       'DATABASE_URL is missing. Create backend/.env from backend/.env.example and set your Neon pooled connection string.',
     );
   }
-  if ((process.env.STORAGE_DRIVER ?? 'local') === 's3') {
-    if (!process.env.AWS_S3_BUCKET) missing.push('AWS_S3_BUCKET');
-    if (!process.env.AWS_REGION) missing.push('AWS_REGION');
-    // Render has no instance role, so the access keys are the only credential
-    // source. Set AWS_USE_DEFAULT_CREDENTIALS=true to opt into the SDK's own
-    // provider chain (a shared profile, an ECS task role, IRSA).
-    if (process.env.AWS_USE_DEFAULT_CREDENTIALS !== 'true') {
-      if (!process.env.AWS_ACCESS_KEY_ID) missing.push('AWS_ACCESS_KEY_ID');
-      if (!process.env.AWS_SECRET_ACCESS_KEY) missing.push('AWS_SECRET_ACCESS_KEY');
-    }
+  if (isSpacesDriver(process.env.STORAGE_DRIVER)) {
+    if (!process.env.DO_SPACES_BUCKET) missing.push('DO_SPACES_BUCKET');
+    if (!process.env.DO_SPACES_ENDPOINT) missing.push('DO_SPACES_ENDPOINT');
+    // Spaces has no instance roles or metadata service, so a key pair is the
+    // only way to authenticate; there is no provider chain to fall back to.
+    if (!process.env.DO_SPACES_KEY) missing.push('DO_SPACES_KEY');
+    if (!process.env.DO_SPACES_SECRET) missing.push('DO_SPACES_SECRET');
   }
   if (missing.length) {
     throw new Error(
-      `STORAGE_DRIVER=s3 requires ${missing.join(', ')}. Set them on the service, or use STORAGE_DRIVER=local for a machine with a persistent disk.`,
+      `STORAGE_DRIVER=spaces requires ${missing.join(', ')}. Set them on the service, or use STORAGE_DRIVER=local for a machine with a persistent disk.`,
     );
   }
   if (process.env.NODE_ENV === 'production' && !process.env.CLIENT_ORIGIN) {
@@ -118,24 +118,32 @@ export const config = {
   clientOrigins: (process.env.CLIENT_ORIGIN ?? 'http://localhost:5173').split(',').map((value) => value.trim()),
   storageDir: path.resolve(baseDir, process.env.STORAGE_DIR ?? './storage'),
   storageDriver: process.env.STORAGE_DRIVER ?? 'local',
-  s3: {
-    region: process.env.AWS_REGION ?? 'us-east-1',
-    bucket: process.env.AWS_S3_BUCKET ?? '',
-    prefix: (process.env.AWS_S3_PREFIX ?? 'documents').replace(/^\/+|\/+$/g, ''),
-    endpoint: process.env.AWS_S3_ENDPOINT,
-    forcePathStyle: process.env.AWS_S3_FORCE_PATH_STYLE === 'true',
-    // Left undefined when AWS_USE_DEFAULT_CREDENTIALS=true, which hands the
-    // client back to the SDK's own provider chain.
-    accessKeyId: process.env.AWS_USE_DEFAULT_CREDENTIALS === 'true' ? undefined : process.env.AWS_ACCESS_KEY_ID,
-    secretAccessKey: process.env.AWS_USE_DEFAULT_CREDENTIALS === 'true' ? undefined : process.env.AWS_SECRET_ACCESS_KEY,
-    sessionToken: process.env.AWS_SESSION_TOKEN,
-    // The SDK frames PutObject as `aws-chunked` to append a trailing checksum.
-    // Real S3 handles that; some S3-compatible stores (R2, Spaces, older
-    // MinIO) reject it. This sends a plain body with a Content-Length instead.
-    disableChecksums: process.env.AWS_S3_DISABLE_CHECKSUMS === 'true',
-    maxAttempts: positiveInteger(process.env.AWS_S3_MAX_ATTEMPTS, 3, 10),
-    connectionTimeoutMs: positiveInteger(process.env.AWS_S3_CONNECTION_TIMEOUT_MS, 5_000),
-    requestTimeoutMs: positiveInteger(process.env.AWS_S3_REQUEST_TIMEOUT_MS, 120_000),
+  // DigitalOcean Spaces. The names below are the service's, not the SDK's: the
+  // AWS SDK is used because Spaces speaks the S3 protocol, which is an
+  // implementation detail rather than a statement about who stores the files.
+  spaces: {
+    // Signing needs a region, and it has to be the one in the endpoint host.
+    // There is no sensible default: a wrong guess fails every request with a
+    // signature error, so an unset value is left to the boot check above.
+    region: process.env.DO_SPACES_REGION ?? '',
+    bucket: process.env.DO_SPACES_BUCKET ?? '',
+    prefix: (process.env.DO_SPACES_PREFIX ?? 'documents').replace(/^\/+|\/+$/g, ''),
+    // What actually selects Spaces over AWS. Without it the SDK resolves an
+    // amazonaws.com host and a Spaces region name signs against nothing.
+    endpoint: process.env.DO_SPACES_ENDPOINT,
+    forcePathStyle: process.env.DO_SPACES_FORCE_PATH_STYLE !== 'false',
+    accessKeyId: process.env.DO_SPACES_KEY,
+    secretAccessKey: process.env.DO_SPACES_SECRET,
+    // The SDK frames PutObject as `aws-chunked` to append a trailing checksum,
+    // which Spaces rejects. Sending a plain body with a Content-Length is the
+    // default here, because no Spaces region accepts the chunked framing.
+    disableChecksums: process.env.DO_SPACES_DISABLE_CHECKSUMS !== 'false',
+    // Spaces encrypts at rest on its own and has no SSE header to request, so
+    // this is off unless a deployment points these variables at real S3.
+    serverSideEncryption: process.env.DO_SPACES_SSE,
+    maxAttempts: positiveInteger(process.env.DO_SPACES_MAX_ATTEMPTS, 3, 10),
+    connectionTimeoutMs: positiveInteger(process.env.DO_SPACES_CONNECTION_TIMEOUT_MS, 5_000),
+    requestTimeoutMs: positiveInteger(process.env.DO_SPACES_REQUEST_TIMEOUT_MS, 120_000),
   },
   tempDir: path.resolve(baseDir, process.env.TEMP_DIR ?? './tmp'),
   tesseractLanguages: [...new Set([

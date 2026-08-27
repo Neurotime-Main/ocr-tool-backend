@@ -30,6 +30,22 @@ const PSM_AUTO_OSD = '1';
 const PSM_AUTO = '3';
 const PSM_SPARSE_OSD = '12';
 const PSM_SPARSE = '11';
+/**
+ * Recognition and rasterisation are done by two binaries the Dockerfile
+ * installs. When one is absent Node reports a bare `spawn <name> ENOENT`,
+ * which is stored verbatim as the page status and tells the user nothing they
+ * can act on -- so it is translated here into the command that installs it.
+ */
+const MISSING_BINARY_HELP: Record<string, string> = {
+  tesseract: "The OCR engine is not installed on this machine. Install it with 'sudo apt-get install -y tesseract-ocr' (macOS: 'brew install tesseract'), then restart the API. A container gets it from the Dockerfile.",
+  pdftoppm: "The PDF page renderer (Poppler) is not installed on this machine. Install it with 'sudo apt-get install -y poppler-utils' (macOS: 'brew install poppler'), then restart the API. A container gets it from the Dockerfile.",
+};
+
+function describeToolFailure(tool: string, error: unknown) {
+  if ((error as NodeJS.ErrnoException | undefined)?.code !== 'ENOENT') return error;
+  return new Error(MISSING_BINARY_HELP[tool] ?? `The '${tool}' binary is not on PATH.`);
+}
+
 const MIN_USABLE_CHARACTERS = 35;
 const MIN_USABLE_WORDS = 6;
 const PAGE_DB_CHUNK = 25;
@@ -150,7 +166,7 @@ async function runTesseract(
     // `execFile` reports an aborted child as a generic failure; the caller
     // needs to see it as a cancellation so the batch is not marked failed.
     if (signal.aborted) throw new OcrCancelledError();
-    throw error;
+    throw describeToolFailure('tesseract', error);
   }
 
   try {
@@ -192,7 +208,7 @@ export function checkOcrEngine() {
     .catch((error: unknown) => ({
       ok: false,
       detail: (error as NodeJS.ErrnoException).code === 'ENOENT'
-        ? "the 'tesseract' binary is not on PATH; rebuild the image, whose Dockerfile installs it"
+        ? MISSING_BINARY_HELP.tesseract!
         : (error as Error).message,
     }));
   return ocrEngineCheck;
@@ -419,7 +435,7 @@ async function renderPage(pdfPath: string, pageNumber: number, outputBase: strin
     // `execFile` reports an aborted child as a generic failure; the caller
     // needs to see it as a cancellation so the batch is not marked failed.
     if (signal.aborted) throw new OcrCancelledError();
-    throw error;
+    throw describeToolFailure('pdftoppm', error);
   } finally {
     renderSlots.release();
   }

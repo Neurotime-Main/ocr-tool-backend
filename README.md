@@ -6,7 +6,7 @@ Standalone Node.js/Express backend for batch OCR processing, highlight persisten
 
 - **Render:** Docker web service. The image includes Poppler for PDF text extraction and page rasterization.
 - **Neon:** PostgreSQL database accessed through Prisma.
-- **AWS S3:** Private storage for uploaded source PDFs. Render's filesystem is used only for temporary page images and exported files.
+- **DigitalOcean Spaces (`ams3`):** Private storage for uploaded source PDFs, reached through the S3 SDK. Render's filesystem is used only for temporary page images and exported files.
 - **Tesseract:** Runs inside the Render service with bundled English and Azerbaijani language data; no OCR API is called.
 
 OCR supports `eng`, `aze`, and mixed `aze+eng`. Automatic mode uses usable embedded PDF text when available and OCRs image-based or low-quality pages. Force OCR mode rasterizes every page and falls back to sparse-text layout analysis for decorated forms, posters, columns, and scattered text. The Render Docker image includes Tesseract's official English and Azerbaijani models; OCR remains entirely local to the server.
@@ -71,32 +71,33 @@ Create a Neon project and copy both connection strings from its connection dialo
 
 Both URLs should include `sslmode=require`. The Docker startup command runs `prisma migrate deploy` before starting the API.
 
-## AWS S3 setup
+## Object storage setup
 
-Render's filesystem is ephemeral, so uploaded PDFs must live in S3. Create a **private** bucket with Block Public Access enabled, in the same region as the Neon database (`eu-central-1` for this project). The frontend never talks to S3 directly, so the bucket needs no public access and no browser CORS rules.
+Render's filesystem is ephemeral, so uploaded PDFs must live in object storage. This project uses a **DigitalOcean Space in `ams3` (Amsterdam)**. The AWS SDK is the client because Spaces speaks the S3 protocol, but no AWS account is involved: `DO_SPACES_ENDPOINT` is what decides which service is called.
 
-Create a dedicated IAM user with programmatic access, limited to the configured prefix:
+Create the Space with **File Listing set to Restricted**. The frontend never talks to object storage directly — every byte is streamed back through the API — so the Space needs no public access and no browser CORS rules.
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-      "Resource": "arn:aws:s3:::YOUR_BUCKET/documents/*"
-    }
-  ]
-}
-```
+Then create a **Spaces access key** (API → Spaces Keys). These are not AWS IAM credentials and carry no JSON policy; scope the key to this one Space if your team's plan offers scoped keys.
 
-Those three actions are all the service uses. `/api/health` deliberately probes with `HeadObject` on a non-existent key rather than `HeadBucket`, so this policy is sufficient — no `s3:ListBucket` needed.
+| Variable | Value |
+| --- | --- |
+| `DO_SPACES_ENDPOINT` | `https://ams3.digitaloceanspaces.com` |
+| `DO_SPACES_REGION` | `ams3` |
+| `DO_SPACES_BUCKET` | the Space name alone — no region, no URL |
+| `DO_SPACES_FORCE_PATH_STYLE` | `true` |
+| `DO_SPACES_DISABLE_CHECKSUMS` | `true` |
 
-Objects are written with `ServerSideEncryption: AES256` and an explicit `ContentLength`, and are streamed back through the application boundary. Enabling default bucket encryption (SSE-S3 or SSE-KMS) on top is fine.
+`DO_SPACES_DISABLE_CHECKSUMS` is the one that is easy to miss. The SDK otherwise frames `PutObject` as `aws-chunked` to append a trailing checksum, which Spaces rejects — uploads then fail with a signature or `InvalidArgument` error while every other call keeps working.
+
+`/api/health` probes with `HeadObject` on a key that does not exist, rather than `HeadBucket`, so it needs only read permission and a `404` counts as success.
+
+Objects are written with an explicit `ContentLength` and no SSE header — Spaces encrypts at rest on its own and rejects the header AWS expects. Set `DO_SPACES_SSE=AES256` only if these variables are ever repointed at real S3.
 
 A lifecycle rule on the `documents/` prefix is worth adding if uploads are not meant to be kept forever; the app only deletes an object when a batch is cancelled.
 
-For S3-compatible storage that is not AWS (MinIO, Cloudflare R2, DigitalOcean Spaces), set `AWS_S3_ENDPOINT`, `AWS_S3_FORCE_PATH_STYLE=true`, and usually `AWS_S3_DISABLE_CHECKSUMS=true` — the SDK otherwise frames uploads as `aws-chunked`, which several of those stores reject.
+Amsterdam and the Frankfurt API are about 350 km apart, which is a low-single-digit millisecond hop — fine. Keeping storage in the same city as the database matters more than matching the API, because a page image is pulled back for every OCR'd page.
+
+To move to real AWS S3 instead, unset `DO_SPACES_ENDPOINT`, set `DO_SPACES_FORCE_PATH_STYLE=false` and `DO_SPACES_DISABLE_CHECKSUMS=false`, set `DO_SPACES_SSE=AES256`, set `DO_SPACES_REGION` to a genuine region such as `eu-central-1`, and grant an IAM user `s3:GetObject`, `s3:PutObject`, and `s3:DeleteObject` on `arn:aws:s3:::YOUR_BUCKET/documents/*`. Those three actions are all the service uses.
 
 This MVP has no user authentication, so add it before accepting untrusted public uploads.
 
@@ -117,12 +118,15 @@ Render supplies `PORT` itself. Never commit AWS or Neon secrets.
 | `DATABASE_URL` | Neon **pooled** string (host contains `-pooler`), `?sslmode=require` | *secret* |
 | `DIRECT_URL` | Neon **direct** string, `?sslmode=require` | *secret* |
 | `CLIENT_ORIGIN` | `https://YOUR-APP.vercel.app,https://YOUR-APP-*.vercel.app` | *secret* |
-| `STORAGE_DRIVER` | `s3` | in `render.yaml` |
-| `AWS_S3_BUCKET` | your private bucket name | *secret* |
-| `AWS_REGION` | `eu-central-1` | *secret* |
-| `AWS_ACCESS_KEY_ID` | IAM user key | *secret* |
-| `AWS_SECRET_ACCESS_KEY` | IAM user secret | *secret* |
-| `AWS_S3_PREFIX` | `documents` | in `render.yaml` |
+| `STORAGE_DRIVER` | `spaces` | in `render.yaml` |
+| `DO_SPACES_BUCKET` | the Space name alone | *secret* |
+| `DO_SPACES_ENDPOINT` | `https://ams3.digitaloceanspaces.com` | in `render.yaml` |
+| `DO_SPACES_REGION` | `ams3` | in `render.yaml` |
+| `DO_SPACES_FORCE_PATH_STYLE` | `true` | in `render.yaml` |
+| `DO_SPACES_DISABLE_CHECKSUMS` | `true` | in `render.yaml` |
+| `DO_SPACES_KEY` | Spaces access key | *secret* |
+| `DO_SPACES_SECRET` | Spaces secret | *secret* |
+| `DO_SPACES_PREFIX` | `documents` | in `render.yaml` |
 | `MAX_BATCH_FILES` / `MAX_UPLOAD_MB` | `30` / `50` | in `render.yaml` |
 | `OCR_RENDER_DPI` / `OCR_MAX_PAGE_PIXELS` | `260` / `12000000` | in `render.yaml` |
 | `OCR_CONCURRENCY` | leave unset | sized from CPU and free memory |
