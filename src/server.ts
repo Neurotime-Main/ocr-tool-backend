@@ -95,12 +95,23 @@ async function discardDocuments(ids: string[]) {
 }
 
 app.get('/api/health', async (_request, response) => {
-  try {
-    await prisma.$queryRaw`SELECT 1`;
-    response.json({ ok: true, database: 'connected', storage: config.storageDriver });
-  } catch {
-    response.status(503).json({ ok: false, database: 'unavailable' });
-  }
+  // Render gates a deploy on this endpoint, so it reports on both dependencies
+  // the service cannot work without. A broken bucket policy or a wrong region
+  // then fails the deploy instead of surfacing on a user's first upload.
+  const [database, storageStatus] = await Promise.all([
+    prisma.$queryRaw`SELECT 1`.then(() => 'connected' as const).catch(() => 'unavailable' as const),
+    storage.check(),
+  ]);
+  const ok = database === 'connected' && storageStatus.ok;
+  response.status(ok ? 200 : 503).json({
+    ok,
+    database,
+    storage: {
+      driver: storageStatus.driver,
+      ok: storageStatus.ok,
+      ...(storageStatus.ok ? { target: storageStatus.detail } : { error: storageStatus.detail }),
+    },
+  });
 });
 
 app.post('/api/documents', upload.single('file'), async (request, response, next) => {

@@ -73,9 +73,9 @@ Both URLs should include `sslmode=require`. The Docker startup command runs `pri
 
 ## AWS S3 setup
 
-Create a private bucket with Block Public Access enabled. The frontend never communicates with S3 directly, so the bucket does not need public access or browser CORS rules.
+Render's filesystem is ephemeral, so uploaded PDFs must live in S3. Create a **private** bucket with Block Public Access enabled, in the same region as the Neon database (`eu-central-1` for this project). The frontend never talks to S3 directly, so the bucket needs no public access and no browser CORS rules.
 
-Create a dedicated IAM user or role limited to the configured prefix. Replace the bucket name and prefix in this policy:
+Create a dedicated IAM user with programmatic access, limited to the configured prefix:
 
 ```json
 {
@@ -90,19 +90,58 @@ Create a dedicated IAM user or role limited to the configured prefix. Replace th
 }
 ```
 
-Uploads use S3 server-side AES-256 encryption and are streamed back through the application boundary. This MVP does not yet implement user authentication, so add authentication before accepting untrusted public uploads.
+Those three actions are all the service uses. `/api/health` deliberately probes with `HeadObject` on a non-existent key rather than `HeadBucket`, so this policy is sufficient — no `s3:ListBucket` needed.
+
+Objects are written with `ServerSideEncryption: AES256` and an explicit `ContentLength`, and are streamed back through the application boundary. Enabling default bucket encryption (SSE-S3 or SSE-KMS) on top is fine.
+
+A lifecycle rule on the `documents/` prefix is worth adding if uploads are not meant to be kept forever; the app only deletes an object when a batch is cancelled.
+
+For S3-compatible storage that is not AWS (MinIO, Cloudflare R2, DigitalOcean Spaces), set `AWS_S3_ENDPOINT`, `AWS_S3_FORCE_PATH_STYLE=true`, and usually `AWS_S3_DISABLE_CHECKSUMS=true` — the SDK otherwise frames uploads as `aws-chunked`, which several of those stores reject.
+
+This MVP has no user authentication, so add it before accepting untrusted public uploads.
 
 ## Deploy to Render
 
 1. Push this `backend` directory as its own Git repository.
-2. In Render, create a Blueprint from the repository. `render.yaml` selects the Docker runtime and `/api/health` health check.
-3. Add the secret environment variables requested by the Blueprint:
-   - `DATABASE_URL` and `DIRECT_URL` from Neon.
-   - `CLIENT_ORIGIN`, for example `https://markwise.vercel.app`. Multiple origins are comma-separated; a project-specific preview pattern such as `https://markwise-*.vercel.app` is supported.
-   - `AWS_REGION`, `AWS_S3_BUCKET`, `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY`.
-4. Deploy and verify `https://YOUR-SERVICE.onrender.com/api/health` returns a connected database and `s3` storage.
+2. In Render, create a Blueprint from the repository. `render.yaml` selects the Docker runtime, the Frankfurt region, the `standard` plan, and the `/api/health` check.
+3. Fill in the secret variables the Blueprint asks for (everything below marked *secret*).
+4. Deploy, then confirm `https://YOUR-SERVICE.onrender.com/api/health` returns `"ok": true` with both `database: "connected"` and `storage.ok: true`.
 
-Render receives `PORT` automatically. Do not add AWS or Neon secrets to Git.
+Render supplies `PORT` itself. Never commit AWS or Neon secrets.
+
+### Render environment variables
+
+| Variable | Value | |
+| --- | --- | --- |
+| `NODE_ENV` | `production` | in `render.yaml` |
+| `DATABASE_URL` | Neon **pooled** string (host contains `-pooler`), `?sslmode=require` | *secret* |
+| `DIRECT_URL` | Neon **direct** string, `?sslmode=require` | *secret* |
+| `CLIENT_ORIGIN` | `https://YOUR-APP.vercel.app,https://YOUR-APP-*.vercel.app` | *secret* |
+| `STORAGE_DRIVER` | `s3` | in `render.yaml` |
+| `AWS_S3_BUCKET` | your private bucket name | *secret* |
+| `AWS_REGION` | `eu-central-1` | *secret* |
+| `AWS_ACCESS_KEY_ID` | IAM user key | *secret* |
+| `AWS_SECRET_ACCESS_KEY` | IAM user secret | *secret* |
+| `AWS_S3_PREFIX` | `documents` | in `render.yaml` |
+| `MAX_BATCH_FILES` / `MAX_UPLOAD_MB` | `30` / `50` | in `render.yaml` |
+| `OCR_RENDER_DPI` / `OCR_MAX_PAGE_PIXELS` | `260` / `12000000` | in `render.yaml` |
+| `OCR_CONCURRENCY` | leave unset | sized from CPU and free memory |
+
+The service refuses to start with a named-variable error if any of the required ones are missing, rather than failing on the first upload.
+
+**Plan sizing.** Each Tesseract worker holds its language models and a WASM heap. On Starter (512 MB) the pool sizes itself down to one page at a time and is close to the memory ceiling; `standard` (2 GB) is the realistic floor for 30-file batches, and more CPU is what makes batches finish faster. Starter and free instances also spin down when idle, which adds a cold start to the first upload and drops any queued OCR — the queue is recovered on restart, but the wait is real.
+
+## Deploy the frontend to Vercel
+
+The frontend is a separate Vercel project pointed at this API.
+
+| Variable | Value |
+| --- | --- |
+| `VITE_API_URL` | `https://YOUR-SERVICE.onrender.com/api` |
+
+Set it for **Production, Preview, and Development**. Vite inlines `VITE_*` at build time, so changing it needs a redeploy, not just a restart. Then add the resulting Vercel origins to the backend's `CLIENT_ORIGIN` and redeploy the API.
+
+Preview deployments get a new hostname per branch, which is why `CLIENT_ORIGIN` accepts a wildcard pattern such as `https://markwise-*.vercel.app`. An origin that is not allowed gets a `403` from the API.
 
 ## Commands
 

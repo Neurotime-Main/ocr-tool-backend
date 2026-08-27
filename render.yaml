@@ -4,31 +4,67 @@ services:
     runtime: docker
     dockerfilePath: ./Dockerfile
     healthCheckPath: /api/health
+    # Your Neon project lives in eu-central-1, so keep the API and the S3
+    # bucket in Frankfurt too. A cross-region hop is paid on every query and
+    # on every page image pulled back for OCR.
+    region: frankfurt
+    # OCR keeps working through a deploy until the queue drains.
     maxShutdownDelaySeconds: 120
+    # OCR is CPU and memory hungry: each Tesseract worker holds its language
+    # models plus a WASM heap. Starter (512 MB) runs one page at a time and is
+    # tight; Standard (2 GB / 1 CPU) is the realistic floor for batches.
+    plan: standard
     envVars:
       - key: NODE_ENV
         value: production
-      - key: STORAGE_DRIVER
-        value: s3
+
+      # --- Neon -------------------------------------------------------------
+      # DATABASE_URL: the POOLED connection string (host contains "-pooler").
+      # DIRECT_URL:   the direct connection string, used by prisma migrate.
+      # Both need ?sslmode=require.
       - key: DATABASE_URL
         sync: false
       - key: DIRECT_URL
         sync: false
+
+      # --- Vercel -----------------------------------------------------------
+      # Comma-separated origins, no trailing slash. Include the preview pattern
+      # so branch deploys are not blocked by CORS, e.g.
+      #   https://markwise.vercel.app,https://markwise-*.vercel.app
       - key: CLIENT_ORIGIN
         sync: false
-      - key: AWS_REGION
-        sync: false
+
+      # --- S3 ---------------------------------------------------------------
+      # Render's disk is ephemeral, so uploaded PDFs must live in S3.
+      - key: STORAGE_DRIVER
+        value: s3
       - key: AWS_S3_BUCKET
         sync: false
-      - key: AWS_S3_PREFIX
-        value: documents
+      # Match the bucket to the database: eu-central-1.
+      - key: AWS_REGION
+        sync: false
       - key: AWS_ACCESS_KEY_ID
         sync: false
       - key: AWS_SECRET_ACCESS_KEY
         sync: false
-      # Leave OCR_CONCURRENCY unset to size the recognition pool from the
-      # instance's CPU count. Set it only to cap memory on a small plan.
-      - key: UPLOAD_STORAGE_CONCURRENCY
-        value: 4
+      - key: AWS_S3_PREFIX
+        value: documents
+
+      # --- Uploads ----------------------------------------------------------
       - key: MAX_BATCH_FILES
         value: 30
+      - key: MAX_UPLOAD_MB
+        value: 50
+      - key: UPLOAD_STORAGE_CONCURRENCY
+        value: 4
+
+      # --- OCR throughput ---------------------------------------------------
+      # Leave OCR_CONCURRENCY unset: the service sizes the recognition pool
+      # from the instance's CPU count and free memory. Set it only to pin the
+      # pool on a small plan, or to raise it after moving to a larger one.
+      # - key: OCR_CONCURRENCY
+      #   value: 2
+      - key: OCR_RENDER_DPI
+        value: 260
+      - key: OCR_MAX_PAGE_PIXELS
+        value: 12000000

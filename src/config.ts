@@ -11,10 +11,37 @@ const baseDir = process.cwd();
 // from a repository parent directory or a process manager.
 dotenv.config({ path: path.resolve(moduleDir, '../.env'), quiet: true });
 
+/**
+ * Fails the process at boot with an actionable message rather than letting a
+ * misconfigured deploy surface as a Prisma or AWS SDK error on the first
+ * upload. Called from db.ts, which every entry point imports.
+ */
 export function assertRuntimeEnvironment() {
+  const missing: string[] = [];
   if (!process.env.DATABASE_URL) {
     throw new Error(
       'DATABASE_URL is missing. Create backend/.env from backend/.env.example and set your Neon pooled connection string.',
+    );
+  }
+  if ((process.env.STORAGE_DRIVER ?? 'local') === 's3') {
+    if (!process.env.AWS_S3_BUCKET) missing.push('AWS_S3_BUCKET');
+    if (!process.env.AWS_REGION) missing.push('AWS_REGION');
+    // Render has no instance role, so the access keys are the only credential
+    // source. Set AWS_USE_DEFAULT_CREDENTIALS=true to opt into the SDK's own
+    // provider chain (a shared profile, an ECS task role, IRSA).
+    if (process.env.AWS_USE_DEFAULT_CREDENTIALS !== 'true') {
+      if (!process.env.AWS_ACCESS_KEY_ID) missing.push('AWS_ACCESS_KEY_ID');
+      if (!process.env.AWS_SECRET_ACCESS_KEY) missing.push('AWS_SECRET_ACCESS_KEY');
+    }
+  }
+  if (missing.length) {
+    throw new Error(
+      `STORAGE_DRIVER=s3 requires ${missing.join(', ')}. Set them on the service, or use STORAGE_DRIVER=local for a machine with a persistent disk.`,
+    );
+  }
+  if (process.env.NODE_ENV === 'production' && !process.env.CLIENT_ORIGIN) {
+    throw new Error(
+      'CLIENT_ORIGIN is missing. Set it to your Vercel origin, for example https://markwise.vercel.app (comma-separated for several, and https://markwise-*.vercel.app for previews).',
     );
   }
 }
@@ -60,6 +87,18 @@ export const config = {
     prefix: (process.env.AWS_S3_PREFIX ?? 'documents').replace(/^\/+|\/+$/g, ''),
     endpoint: process.env.AWS_S3_ENDPOINT,
     forcePathStyle: process.env.AWS_S3_FORCE_PATH_STYLE === 'true',
+    // Left undefined when AWS_USE_DEFAULT_CREDENTIALS=true, which hands the
+    // client back to the SDK's own provider chain.
+    accessKeyId: process.env.AWS_USE_DEFAULT_CREDENTIALS === 'true' ? undefined : process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_USE_DEFAULT_CREDENTIALS === 'true' ? undefined : process.env.AWS_SECRET_ACCESS_KEY,
+    sessionToken: process.env.AWS_SESSION_TOKEN,
+    // The SDK frames PutObject as `aws-chunked` to append a trailing checksum.
+    // Real S3 handles that; some S3-compatible stores (R2, Spaces, older
+    // MinIO) reject it. This sends a plain body with a Content-Length instead.
+    disableChecksums: process.env.AWS_S3_DISABLE_CHECKSUMS === 'true',
+    maxAttempts: positiveInteger(process.env.AWS_S3_MAX_ATTEMPTS, 3, 10),
+    connectionTimeoutMs: positiveInteger(process.env.AWS_S3_CONNECTION_TIMEOUT_MS, 5_000),
+    requestTimeoutMs: positiveInteger(process.env.AWS_S3_REQUEST_TIMEOUT_MS, 120_000),
   },
   tempDir: path.resolve(baseDir, process.env.TEMP_DIR ?? './tmp'),
   tesseractLanguages: [...new Set([
