@@ -112,8 +112,9 @@ async function runTesseract(
 ) {
   const tessdataDir = await languageDataPath(language);
   throwIfCancelled(signal);
+  let stderr = '';
   try {
-    await execFileAsync('tesseract', [
+    ({ stderr } = await execFileAsync('tesseract', [
       imagePath, outputBase,
       '-l', language,
       // Explicit, because TESSDATA_PREFIX has meant both this directory and its
@@ -124,7 +125,14 @@ async function runTesseract(
       '--psm', pageSegmentationMode,
       '--dpi', String(dpi),
       '-c', 'preserve_interword_spaces=1',
-      'tsv', 'txt',
+      // The word boxes and the text are requested as parameters rather than as
+      // the `tsv` and `txt` config files that would normally select them.
+      // Naming a config file makes Tesseract look for it under the tessdata
+      // directory, which here holds only the models, and a config it cannot
+      // open is skipped with a message on stderr and an exit code of 0 -- so
+      // the run would appear to succeed while writing no TSV at all.
+      '-c', 'tessedit_create_tsv=1',
+      '-c', 'tessedit_create_txt=1',
     ], {
       signal,
       maxBuffer: 8 * 1024 * 1024,
@@ -137,7 +145,7 @@ async function runTesseract(
         // single-threaded and the semaphore alone decides how busy the CPU is.
         OMP_THREAD_LIMIT: '1',
       },
-    });
+    }));
   } catch (error) {
     // `execFile` reports an aborted child as a generic failure; the caller
     // needs to see it as a cancellation so the batch is not marked failed.
@@ -147,7 +155,14 @@ async function runTesseract(
 
   try {
     const [tsv, text] = await Promise.all([
-      readFile(`${outputBase}.tsv`, 'utf8'),
+      // Tesseract exits 0 even when it could not apply what it was asked for,
+      // so a missing TSV is the first place that failure becomes visible. Its
+      // own diagnostics are carried into the message, because the page status
+      // is all an operator gets to see.
+      readFile(`${outputBase}.tsv`, 'utf8').catch(() => {
+        const detail = stderr.trim().split(/\r?\n/).filter(Boolean).slice(0, 3).join('; ');
+        throw new Error(`Tesseract wrote no TSV for this page${detail ? `: ${detail}` : '.'}`);
+      }),
       readFile(`${outputBase}.txt`, 'utf8').catch(() => ''),
     ]);
     return { tsv, text };

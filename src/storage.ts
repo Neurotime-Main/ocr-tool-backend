@@ -1,5 +1,5 @@
 import { createReadStream, createWriteStream } from 'node:fs';
-import { mkdir, rename, stat, unlink } from 'node:fs/promises';
+import { access, mkdir, rename, stat, unlink } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import path from 'node:path';
@@ -37,7 +37,18 @@ export class LocalFileStorage implements FileStorage {
   }
 
   async materialize(key: string, _destinationDir: string) {
-    return this.resolve(key);
+    const source = this.resolve(key);
+    // The file is read where it already lives, so nothing is copied. It is
+    // checked here because a local storage directory does not survive a restart
+    // on a host with an ephemeral disk, while the database row does: without
+    // this the loss surfaces as an ENOENT from whichever stage touched the file
+    // first, naming a path that says nothing about the cause.
+    await access(source).catch(() => {
+      throw new Error(
+        'The stored PDF is missing. A local storage directory is erased when the host restarts or redeploys; set STORAGE_DRIVER=s3 so uploads outlive a deploy.',
+      );
+    });
+    return source;
   }
 
   async createReadStream(key: string) {

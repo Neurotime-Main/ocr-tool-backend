@@ -27,6 +27,10 @@ COPY --from=build /app/dist ./dist
 # `--build-arg TESSDATA_VARIANT=tessdata_best` to trade that speed back for the
 # most accurate models on very poor-quality originals.
 #
+# aze.traineddata declares `tessedit_load_sublangs aze_cyrl`, so Tesseract loads
+# the Cyrillic Azerbaijani model alongside it. Without that file it prints a
+# load error, exits 0 anyway, and reads Cyrillic text as nothing.
+#
 # osd.traineddata is the orientation model, always taken from tessdata_fast
 # because the accuracy variants do not all publish one. Without it Tesseract
 # cannot straighten a sideways scan, and the service falls back to the layout
@@ -35,6 +39,7 @@ ARG TESSDATA_VARIANT=tessdata_fast
 RUN mkdir -p storage tmp tessdata \
     && curl --fail --location --retry 3 --output tessdata/eng.traineddata "https://github.com/tesseract-ocr/${TESSDATA_VARIANT}/raw/main/eng.traineddata" \
     && curl --fail --location --retry 3 --output tessdata/aze.traineddata "https://github.com/tesseract-ocr/${TESSDATA_VARIANT}/raw/main/aze.traineddata" \
+    && curl --fail --location --retry 3 --output tessdata/aze_cyrl.traineddata "https://github.com/tesseract-ocr/${TESSDATA_VARIANT}/raw/main/aze_cyrl.traineddata" \
     && curl --fail --location --retry 3 --output tessdata/osd.traineddata "https://github.com/tesseract-ocr/tessdata_fast/raw/main/osd.traineddata"
 ENV TESSDATA_PATH=/app/tessdata
 ENV TESSDATA_PREFIX=/app/tessdata
