@@ -15,11 +15,11 @@ The batch API accepts up to 30 PDFs per request. Source files are persisted to S
 
 ## OCR throughput
 
-Pages, not documents, are the unit of parallel work. Every queued document draws from one shared pool of warm Tesseract workers, so a single 40-page scan uses the whole machine just as a 30-file batch does. The knobs:
+Pages, not documents, are the unit of parallel work. Every queued document draws from one shared pool of recognition slots, so a single 40-page scan uses the whole machine just as a 30-file batch does. Each slot runs the native `tesseract` binary as a short-lived process per page. The knobs:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `OCR_CONCURRENCY` | smaller of CPU cores − 1 and free memory ÷ 512 MB, capped at 8 | Pages recognized at the same time across all documents. Each worker holds its language models and a WASM heap, so the default stays at 1 on a small container instead of being OOM-killed. |
+| `OCR_CONCURRENCY` | smaller of CPU cores − 1 and free memory ÷ 192 MB, capped at 8 | Pages recognized at the same time across all documents. "CPU cores" is the container's cgroup CPU quota where one is set, not the host's core count, so a fractional-CPU plan does not oversubscribe itself. |
 | `OCR_DOCUMENT_CONCURRENCY` | `OCR_CONCURRENCY` (min 2) | Documents allowed to have pages in flight. |
 | `OCR_RENDER_CONCURRENCY` | half of `OCR_CONCURRENCY` (min 2) | Parallel Poppler rasterizations. Rendering overlaps recognition instead of blocking it. |
 | `OCR_RENDER_DPI` | `260` | Target rasterization DPI. Use `300` for difficult small print. |
@@ -129,7 +129,7 @@ Render supplies `PORT` itself. Never commit AWS or Neon secrets.
 
 The service refuses to start with a named-variable error if any of the required ones are missing, rather than failing on the first upload.
 
-**Plan sizing.** Each Tesseract worker holds its language models and a WASM heap. On Starter (512 MB) the pool sizes itself down to one page at a time and is close to the memory ceiling; `standard` (2 GB) is the realistic floor for 30-file batches, and more CPU is what makes batches finish faster. Starter and free instances also spin down when idle, which adds a cold start to the first upload and drops any queued OCR — the queue is recovered on restart, but the wait is real.
+**Plan sizing.** Recognition is a native `tesseract` process per page, holding the page raster and its language model. On Starter (512 MB) the pool still sizes itself down to one page at a time; `standard` (2 GB) is the realistic floor for 30-file batches, and CPU is what decides how long a page takes. Because the pool is capped by the cgroup CPU quota, a fractional-CPU plan recognizes one page at a time no matter how many cores the host reports. Starter and free instances also spin down when idle, which adds a cold start to the first upload and drops any queued OCR — the queue is recovered on restart, but the wait is real.
 
 ## Deploy the frontend to Vercel
 

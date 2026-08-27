@@ -1,4 +1,5 @@
 import dotenv from 'dotenv';
+import { readFileSync } from 'node:fs';
 import { availableParallelism, freemem, totalmem } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -52,24 +53,60 @@ function positiveInteger(value: string | undefined, fallback: number, maximum = 
   return Math.min(maximum, Math.floor(parsed));
 }
 
+/**
+ * The share of a CPU this container is actually scheduled for, or Infinity when
+ * nothing caps it. `availableParallelism` reports the host's cores, which on a
+ * platform that limits CPU through cgroups (Render, Fly, ECS) is several times
+ * more than the process will ever get: sizing the pool from it puts every page
+ * into contention instead of running the batch faster.
+ */
+function cgroupCpuLimit() {
+  try {
+    // cgroup v2: "<quota> <period>", or "max <period>" when uncapped.
+    const [quota, period] = readFileSync('/sys/fs/cgroup/cpu.max', 'utf8').trim().split(/\s+/);
+    if (quota && quota !== 'max' && period) {
+      const limit = Number(quota) / Number(period);
+      if (Number.isFinite(limit) && limit > 0) return limit;
+    }
+  } catch { /* not cgroup v2, or not readable */ }
+  try {
+    // cgroup v1.
+    const quota = Number(readFileSync('/sys/fs/cgroup/cpu/cpu.cfs_quota_us', 'utf8').trim());
+    const period = Number(readFileSync('/sys/fs/cgroup/cpu/cpu.cfs_period_us', 'utf8').trim());
+    if (quota > 0 && period > 0) return quota / period;
+  } catch { /* not cgroup v1, or not readable */ }
+  return Number.POSITIVE_INFINITY;
+}
+
 // Tesseract recognition is CPU bound, so the useful amount of parallel work is
 // set by the number of cores rather than by a fixed number. One core is left
 // for the HTTP server, PDF rendering, and the database client.
 const cpuCount = (() => {
-  try { return availableParallelism(); } catch { return 2; }
+  const reported = (() => {
+    try { return availableParallelism(); } catch { return 2; }
+  })();
+  const limit = cgroupCpuLimit();
+  // A fractional allowance still runs one page, just not two at once.
+  return Number.isFinite(limit) ? Math.max(1, Math.min(reported, Math.floor(limit))) : reported;
 })();
 
-// Each warm worker holds its language models and a WASM heap, so the pool is
-// also capped by memory. Without this a small container would happily start
-// eight workers and be killed by the OOM reaper. `availableMemory` is used
-// where the runtime has it, because a developer machine can have plenty of RAM
-// installed and almost none of it free.
-const WORKER_MEMORY_BUDGET = 512 * 1024 * 1024;
+// Each concurrent page holds a `tesseract` process with the page raster and its
+// language model, so the pool is also capped by memory. Without this a small
+// container would happily start eight of them and be killed by the OOM reaper.
+// `availableMemory` is used where the runtime has it, because a developer
+// machine can have plenty of RAM installed and almost none of it free.
+//
+// A native process needs a fraction of what the previous in-process WASM worker
+// did, which is why this budget no longer pins a 2 GB instance to a single page
+// at a time.
+const WORKER_MEMORY_BUDGET = 192 * 1024 * 1024;
 const usableMemory = (() => {
   const available = (globalThis as { process?: { availableMemory?: () => number } }).process?.availableMemory;
   const free = typeof available === 'function' ? available() : freemem();
-  // Leave room for the HTTP server, Poppler, and the rest of the host.
-  return Math.max(0, Math.min(free, totalmem()) - 512 * 1024 * 1024);
+  // Leave room for the HTTP server, Poppler, and the rest of the host. Node no
+  // longer carries the recognition heap itself, so this reserve is smaller than
+  // it had to be for the WASM engine.
+  return Math.max(0, Math.min(free, totalmem()) - 256 * 1024 * 1024);
 })();
 const memoryBoundConcurrency = Math.max(1, Math.floor(usableMemory / WORKER_MEMORY_BUDGET));
 const defaultOcrConcurrency = Math.max(1, Math.min(8, cpuCount - 1, memoryBoundConcurrency));
@@ -125,7 +162,13 @@ export const config = {
   documentConcurrency: positiveInteger(process.env.OCR_DOCUMENT_CONCURRENCY, Math.max(2, ocrConcurrency), 32),
   // Poppler competes with Tesseract for the same cores, so rendering runs at a
   // lower width and is overlapped with recognition instead of blocking it.
-  renderConcurrency: positiveInteger(process.env.OCR_RENDER_CONCURRENCY, Math.max(2, Math.ceil(ocrConcurrency / 2)), 32),
+  // Never more rasterisers than the container has CPU for: on a one-core plan a
+  // second Poppler process only takes time away from recognition.
+  renderConcurrency: positiveInteger(
+    process.env.OCR_RENDER_CONCURRENCY,
+    Math.max(1, Math.min(cpuCount, Math.ceil(ocrConcurrency / 2))),
+    32,
+  ),
   uploadStorageConcurrency: positiveInteger(process.env.UPLOAD_STORAGE_CONCURRENCY, 4, 8),
   maxUploadBytes: Number(process.env.MAX_UPLOAD_MB ?? 50) * 1024 * 1024,
   maxBatchFiles: positiveInteger(process.env.MAX_BATCH_FILES, 30),

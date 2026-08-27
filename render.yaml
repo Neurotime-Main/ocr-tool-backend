@@ -10,9 +10,11 @@ services:
     region: frankfurt
     # OCR keeps working through a deploy until the queue drains.
     maxShutdownDelaySeconds: 120
-    # OCR is CPU and memory hungry: each Tesseract worker holds its language
-    # models plus a WASM heap. Starter (512 MB) runs one page at a time and is
-    # tight; Standard (2 GB / 1 CPU) is the realistic floor for batches.
+    # OCR is CPU and memory hungry: each page runs a native Tesseract process
+    # holding the raster and its language model. Starter (512 MB) runs one page
+    # at a time and is tight; Standard (2 GB / 1 CPU) is the realistic floor for
+    # batches. CPU is what decides per-page latency, so more cores is the upgrade
+    # that makes a large document finish sooner.
     plan: standard
     envVars:
       - key: NODE_ENV

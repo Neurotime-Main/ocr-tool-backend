@@ -7,7 +7,7 @@ import { config } from './config.js';
 import { prisma } from './db.js';
 import { storage } from './storage.js';
 import {
-  cancelDocumentProcessing, enqueueDocumentProcessing, ensureOcrDirectories,
+  cancelDocumentProcessing, checkOcrEngine, enqueueDocumentProcessing, ensureOcrDirectories,
   getOcrProgress, resumeQueuedOcrJobs, shutdownOcrWorkers,
 } from './ocr.js';
 import { addHighlightsToPdf } from './exportPdf.js';
@@ -95,14 +95,16 @@ async function discardDocuments(ids: string[]) {
 }
 
 app.get('/api/health', async (_request, response) => {
-  // Render gates a deploy on this endpoint, so it reports on both dependencies
-  // the service cannot work without. A broken bucket policy or a wrong region
-  // then fails the deploy instead of surfacing on a user's first upload.
-  const [database, storageStatus] = await Promise.all([
+  // Render gates a deploy on this endpoint, so it reports on every dependency
+  // the service cannot work without. A broken bucket policy, a wrong region, or
+  // an image missing the OCR binary then fails the deploy instead of surfacing
+  // on a user's first upload.
+  const [database, storageStatus, ocrEngine] = await Promise.all([
     prisma.$queryRaw`SELECT 1`.then(() => 'connected' as const).catch(() => 'unavailable' as const),
     storage.check(),
+    checkOcrEngine(),
   ]);
-  const ok = database === 'connected' && storageStatus.ok;
+  const ok = database === 'connected' && storageStatus.ok && ocrEngine.ok;
   response.status(ok ? 200 : 503).json({
     ok,
     database,
@@ -110,6 +112,10 @@ app.get('/api/health', async (_request, response) => {
       driver: storageStatus.driver,
       ok: storageStatus.ok,
       ...(storageStatus.ok ? { target: storageStatus.detail } : { error: storageStatus.detail }),
+    },
+    ocr: {
+      ok: ocrEngine.ok,
+      ...(ocrEngine.ok ? { engine: ocrEngine.detail } : { error: ocrEngine.detail }),
     },
   });
 });

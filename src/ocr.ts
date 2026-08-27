@@ -1,9 +1,9 @@
 import { execFile } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { copyFile, mkdir, mkdtemp, open, rm } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { createWorker, OEM, PSM } from 'tesseract.js';
+import { gunzip } from 'node:zlib';
 import { config } from './config.js';
 import { prisma } from './db.js';
 import { extractPdfPages, type ExtractedPage } from './pdfText.js';
@@ -12,11 +12,24 @@ import { hasLegacyAzeriFontEncoding } from './reportText.js';
 import type { OcrWord } from './types.js';
 
 const execFileAsync = promisify(execFile);
+const gunzipAsync = promisify(gunzip);
 const require = createRequire(import.meta.url);
+// Compressed copies of the official models, used only where the deployment does
+// not ship its own tessdata directory. They are expanded once into the temp
+// directory, because the native binary reads plain .traineddata files.
 const bundledLanguageFiles: Record<string, string> = {
   eng: require.resolve('@tesseract.js-data/eng/4.0.0/eng.traineddata.gz'),
   aze: require.resolve('@tesseract.js-data/aze/4.0.0/aze.traineddata.gz'),
 };
+
+// Page segmentation modes. The OSD variants also detect page orientation and
+// rotate the raster before recognition, which is the job `rotateAuto` did on
+// the previous engine. They need osd.traineddata next to the language models,
+// so the plain modes are used wherever it is absent.
+const PSM_AUTO_OSD = '1';
+const PSM_AUTO = '3';
+const PSM_SPARSE_OSD = '12';
+const PSM_SPARSE = '11';
 const MIN_USABLE_CHARACTERS = 35;
 const MIN_USABLE_WORDS = 6;
 const PAGE_DB_CHUNK = 25;
@@ -73,50 +86,101 @@ function createSemaphore(size: number) {
   };
 }
 
-type TesseractWorker = Awaited<ReturnType<typeof createWorker>>;
-type PooledTesseractWorker = { language: string; worker: TesseractWorker };
-
-// Starting a Tesseract worker and loading its language model is expensive.
-// Keep completed workers warm so a 20-file batch pays that cost only for the
-// first workers, rather than once per page or per document. A checked-out
-// worker is never shared, so Tesseract calls remain isolated and safe.
+// Recognition runs as a short-lived `tesseract` process per pass. The native
+// binary reads a page several times faster than the WASM build it replaces and
+// holds a fraction of the memory, so the pool is sized by CPU rather than by
+// how many language models fit in the heap.
 const recognitionSlots = createSemaphore(config.ocrConcurrency);
 const renderSlots = createSemaphore(config.renderConcurrency);
 // Admission control for whole pages, shared by every document. Without it a
 // batch could rasterise hundreds of pages that then sit on disk waiting for a
 // recognition slot; with it, only a handful of rendered images exist at once.
 const pageSlots = createSemaphore(config.ocrConcurrency + config.renderConcurrency);
-const idleTesseractWorkers: PooledTesseractWorker[] = [];
 
-async function acquireTesseractWorker(language: string, signal: AbortSignal): Promise<PooledTesseractWorker> {
-  await recognitionSlots.acquire(signal);
+/**
+ * Runs one recognition pass over a rendered page. Tesseract writes its own
+ * layout-aware text and the word boxes from a single pass, so asking for both
+ * costs nothing on top of the TSV.
+ */
+async function runTesseract(
+  imagePath: string,
+  outputBase: string,
+  language: string,
+  pageSegmentationMode: string,
+  dpi: number,
+  signal: AbortSignal,
+) {
+  const tessdataDir = await languageDataPath(language);
+  throwIfCancelled(signal);
   try {
-    const matching = idleTesseractWorkers.findIndex((entry) => entry.language === language);
-    if (matching !== -1) return idleTesseractWorkers.splice(matching, 1)[0]!;
-
-    // Holding a slot guarantees at most `ocrConcurrency` workers exist, so an
-    // idle worker for another language is evicted before a new one is built.
-    const evicted = idleTesseractWorkers.shift();
-    if (evicted) await evicted.worker.terminate().catch(() => undefined);
-
-    const worker = await createWorker(language, OEM.LSTM_ONLY, {
-      langPath: await languageDataPath(language),
-      cachePath: path.join(config.tempDir, 'tesseract-cache'),
-      gzip: true,
+    await execFileAsync('tesseract', [
+      imagePath, outputBase,
+      '-l', language,
+      // Explicit, because TESSDATA_PREFIX has meant both this directory and its
+      // parent across Tesseract versions.
+      '--tessdata-dir', tessdataDir,
+      // LSTM only, matching the engine the previous worker was built with.
+      '--oem', '1',
+      '--psm', pageSegmentationMode,
+      '--dpi', String(dpi),
+      '-c', 'preserve_interword_spaces=1',
+      'tsv', 'txt',
+    ], {
+      signal,
+      maxBuffer: 8 * 1024 * 1024,
+      env: {
+        ...process.env,
+        TESSDATA_PREFIX: tessdataDir,
+        // Tesseract's OpenMP threading scales poorly and would have every page
+        // in the batch fight for the same cores. Pages are already run in
+        // parallel by the recognition semaphore, so each process stays
+        // single-threaded and the semaphore alone decides how busy the CPU is.
+        OMP_THREAD_LIMIT: '1',
+      },
     });
-    return { language, worker };
   } catch (error) {
-    recognitionSlots.release();
+    // `execFile` reports an aborted child as a generic failure; the caller
+    // needs to see it as a cancellation so the batch is not marked failed.
+    if (signal.aborted) throw new OcrCancelledError();
     throw error;
+  }
+
+  try {
+    const [tsv, text] = await Promise.all([
+      readFile(`${outputBase}.tsv`, 'utf8'),
+      readFile(`${outputBase}.txt`, 'utf8').catch(() => ''),
+    ]);
+    return { tsv, text };
+  } finally {
+    await Promise.all([
+      rm(`${outputBase}.tsv`, { force: true }).catch(() => undefined),
+      rm(`${outputBase}.txt`, { force: true }).catch(() => undefined),
+    ]);
   }
 }
 
-function releaseTesseractWorker(entry: PooledTesseractWorker, healthy: boolean) {
-  if (healthy) idleTesseractWorkers.push(entry);
-  // A cancelled or failed recognition can leave the worker mid-job, so it is
-  // torn down instead of being handed to the next page.
-  else void entry.worker.terminate().catch(() => undefined);
-  recognitionSlots.release();
+// The binary cannot appear or vanish while the process runs, so the answer is
+// resolved once and reused by every later health poll.
+let ocrEngineCheck: Promise<{ ok: boolean; detail: string }> | undefined;
+
+/**
+ * Confirms the recognition engine is installed and reports its version. The
+ * health endpoint gates a Render deploy, so an image built without the binary
+ * fails that deploy instead of failing silently on every upload.
+ */
+export function checkOcrEngine() {
+  ocrEngineCheck ??= execFileAsync('tesseract', ['--version'], { timeout: 10_000 })
+    .then(({ stdout, stderr }) => ({
+      ok: true,
+      detail: (stdout || stderr).split(/\r?\n/)[0]?.trim() || 'tesseract',
+    }))
+    .catch((error: unknown) => ({
+      ok: false,
+      detail: (error as NodeJS.ErrnoException).code === 'ENOENT'
+        ? "the 'tesseract' binary is not on PATH; rebuild the image, whose Dockerfile installs it"
+        : (error as Error).message,
+    }));
+  return ocrEngineCheck;
 }
 
 export function getOcrProgress(documentId: string) {
@@ -129,16 +193,6 @@ export function getOcrProgress(documentId: string) {
   return queueIndex === -1
     ? null
     : { currentPage: 0, totalPages: 0, queuePosition: queueIndex + 1 };
-}
-
-/** Rejects as soon as the job is cancelled, without waiting for `promise`. */
-function untilAborted<T>(promise: Promise<T>, signal: AbortSignal) {
-  if (signal.aborted) return Promise.reject(new OcrCancelledError());
-  return new Promise<T>((resolve, reject) => {
-    const onAbort = () => reject(new OcrCancelledError());
-    signal.addEventListener('abort', onAbort, { once: true });
-    promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
-  });
 }
 
 function throwIfCancelled(signal: AbortSignal) {
@@ -212,30 +266,53 @@ function parseTsv(tsv: string, pageNumber: number, imageWidth: number, imageHeig
     .filter((word): word is OcrWord => word !== null);
 }
 
-// Several workers can start at the same time, and they would otherwise copy
-// the same language files over each other while another worker reads them.
+// Several pages can start at the same time, and they would otherwise expand
+// the same language file over each other while another process reads it.
 const languageDataCopies = new Map<string, Promise<void>>();
 
-function copyLanguageData(code: string, destination: string) {
+function expandLanguageData(code: string, destination: string) {
   const existing = languageDataCopies.get(code);
   if (existing) return existing;
   const source = bundledLanguageFiles[code];
   if (!source) throw new Error(`No bundled Tesseract data is available for '${code}'. Configure TESSDATA_PATH.`);
-  const copy = copyFile(source, path.join(destination, `${code}.traineddata.gz`))
+  const target = path.join(destination, `${code}.traineddata`);
+  // Expanded under a temporary name and renamed into place, so a page that
+  // starts while the model is still being written never reads half a file.
+  const expand = access(target)
+    .catch(async () => {
+      const pending = `${target}.${process.pid}.partial`;
+      await writeFile(pending, await gunzipAsync(await readFile(source)));
+      await rename(pending, target);
+    })
     .catch((error: unknown) => {
       languageDataCopies.delete(code);
       throw error;
     });
-  languageDataCopies.set(code, copy);
-  return copy;
+  languageDataCopies.set(code, expand);
+  return expand;
 }
 
 async function languageDataPath(language: string) {
   if (config.tessdataPath) return config.tessdataPath;
   const destination = path.join(config.tempDir, 'tessdata');
   await mkdir(destination, { recursive: true });
-  await Promise.all(language.split('+').map((code) => copyLanguageData(code, destination)));
+  await Promise.all(language.split('+').map((code) => expandLanguageData(code, destination)));
   return destination;
+}
+
+// Orientation detection is a separate model. An image built from the Dockerfile
+// ships it next to the language models; the bundled fallback data does not, so
+// the answer is resolved once and the plain layouts are used without it.
+const orientationDataChecks = new Map<string, Promise<boolean>>();
+
+function orientationDataAvailable(language: string) {
+  const existing = orientationDataChecks.get(language);
+  if (existing) return existing;
+  const check = languageDataPath(language)
+    .then((directory) => access(path.join(directory, 'osd.traineddata')).then(() => true, () => false))
+    .catch(() => false);
+  orientationDataChecks.set(language, check);
+  return check;
 }
 
 function embeddedTextIsUsable(page: ExtractedPage) {
@@ -264,8 +341,9 @@ function recognitionScore(words: OcrWord[]) {
 }
 
 async function recognizePage(
-  worker: TesseractWorker,
   imagePath: string,
+  outputBase: string,
+  language: string,
   pageNumber: number,
   imageWidth: number,
   imageHeight: number,
@@ -273,25 +351,20 @@ async function recognizePage(
   preferSparseLayout: boolean,
   signal: AbortSignal,
 ) {
-  const run = async (mode: PSM) => {
-    await worker.setParameters({
-      tessedit_pageseg_mode: mode,
-      preserve_interword_spaces: '1',
-      user_defined_dpi: String(renderDpi),
-    });
-    const result = await untilAborted(
-      worker.recognize(imagePath, { rotateAuto: true }, { text: true, tsv: true }),
-      signal,
-    );
-    const tsv = (result.data as typeof result.data & { tsv?: string }).tsv ?? '';
+  const withOrientation = await orientationDataAvailable(language);
+  const run = async (layout: 'auto' | 'sparse') => {
+    const mode = layout === 'auto'
+      ? (withOrientation ? PSM_AUTO_OSD : PSM_AUTO)
+      : (withOrientation ? PSM_SPARSE_OSD : PSM_SPARSE);
+    const result = await runTesseract(imagePath, `${outputBase}-${layout}`, language, mode, renderDpi, signal);
     return {
-      text: result.data.text.trim(),
-      words: parseTsv(tsv, pageNumber, imageWidth, imageHeight),
-      mode,
+      text: result.text.trim(),
+      words: parseTsv(result.tsv, pageNumber, imageWidth, imageHeight),
+      layout,
     };
   };
 
-  const automatic = await run(PSM.AUTO);
+  const automatic = await run('auto');
   const averageConfidence = automatic.words.length
     ? automatic.words.reduce((sum, word) => sum + word.confidence, 0) / automatic.words.length
     : 0;
@@ -303,7 +376,7 @@ async function recognizePage(
   const minimumConfidence = preferSparseLayout ? 72 : 62;
   if (automatic.words.length >= minimumWords && averageConfidence >= minimumConfidence) return automatic;
 
-  const sparse = await run(PSM.SPARSE_TEXT);
+  const sparse = await run('sparse');
   return recognitionScore(sparse.words) > recognitionScore(automatic.words) ? sparse : automatic;
 }
 
@@ -361,24 +434,20 @@ async function readPage(
   }
   try {
     const dimensions = await pngDimensions(imagePath);
-    const pooled = await acquireTesseractWorker(document.ocrLanguage, signal);
-    let healthy = true;
+    await recognitionSlots.acquire(signal);
     try {
       const result = await recognizePage(
-        pooled.worker, imagePath, page.pageNumber,
+        imagePath, path.join(workDir, `page-${page.pageNumber}`), document.ocrLanguage, page.pageNumber,
         dimensions.width, dimensions.height, dpi, forceOcr, signal,
       );
       return {
         ...page,
         words: result.words,
         text: result.text || result.words.map((word) => word.text).join(' '),
-        source: result.mode === PSM.AUTO ? 'tesseract-auto' : 'tesseract-sparse',
+        source: result.layout === 'auto' ? 'tesseract-auto' : 'tesseract-sparse',
       };
-    } catch (error) {
-      healthy = false;
-      throw error;
     } finally {
-      releaseTesseractWorker(pooled, healthy);
+      recognitionSlots.release();
     }
   } finally {
     // Rendered pages are large; releasing each one keeps a long PDF from
@@ -536,13 +605,13 @@ export async function resumeQueuedOcrJobs() {
 export async function ensureOcrDirectories() {
   await Promise.all([
     mkdir(config.tempDir, { recursive: true }),
-    mkdir(path.join(config.tempDir, 'tesseract-cache'), { recursive: true }),
     mkdir(config.storageDir, { recursive: true }),
   ]);
 }
 
-/** Frees the warm Tesseract workers when the process is shutting down. */
-export async function shutdownOcrWorkers() {
-  const workers = idleTesseractWorkers.splice(0, idleTesseractWorkers.length);
-  await Promise.all(workers.map((entry) => entry.worker.terminate().catch(() => undefined)));
-}
+/**
+ * Recognition runs in child processes that exit with the page, and they are
+ * killed with the server, so there is no worker pool left to free. Kept as the
+ * shutdown hook the server already calls.
+ */
+export async function shutdownOcrWorkers() {}
