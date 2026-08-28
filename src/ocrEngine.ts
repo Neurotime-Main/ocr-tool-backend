@@ -168,6 +168,7 @@ class Daemon {
  */
 class DaemonPool {
   private daemons: Array<Daemon | undefined> = [];
+  private idleTimers: Array<NodeJS.Timeout | undefined> = [];
   private idle: number[] = [];
   private waiting: Array<(index: number) => void> = [];
 
@@ -190,6 +191,7 @@ class DaemonPool {
 
   async run(imagePath: string, maxSide: number, signal: AbortSignal) {
     const index = await this.acquire();
+    this.cancelIdleTimer(index);
     try {
       let daemon = this.daemons[index];
       if (!daemon || daemon.isBroken) {
@@ -205,11 +207,43 @@ class DaemonPool {
         throw error;
       }
     } finally {
+      this.scheduleIdleShutdown(index);
       this.release(index);
     }
   }
 
+  private cancelIdleTimer(index: number) {
+    const timer = this.idleTimers[index];
+    if (timer) {
+      clearTimeout(timer);
+      this.idleTimers[index] = undefined;
+    }
+  }
+
+  /**
+   * Releases a slot's daemon once it has gone unused for a while.
+   *
+   * Most pages in these documents are read from the PDF's own text layer and
+   * never reach the recogniser, so a pool that ran once and then idled was
+   * holding several hundred megabytes each for work that had already finished
+   * -- memory the document reader needs, on a container that does not have it
+   * spare. Restarting is cheap enough that keeping them warm is not worth it.
+   */
+  private scheduleIdleShutdown(index: number) {
+    this.cancelIdleTimer(index);
+    const timer = setTimeout(() => {
+      this.idleTimers[index] = undefined;
+      this.daemons[index]?.dispose();
+      this.daemons[index] = undefined;
+    }, config.ocrIdleTimeoutMs);
+    // Must not keep the process alive on its own account.
+    timer.unref?.();
+    this.idleTimers[index] = timer;
+  }
+
   async shutdown() {
+    for (const timer of this.idleTimers) if (timer) clearTimeout(timer);
+    this.idleTimers = [];
     for (const daemon of this.daemons) daemon?.dispose();
     this.daemons = [];
   }

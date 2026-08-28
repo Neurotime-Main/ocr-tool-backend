@@ -34,27 +34,29 @@ const state: WorkerState = {
 };
 
 /**
- * Documents whose pages have not been enumerated yet.
+ * Opens documents that have not been read yet.
  *
- * Preparation is the one step that is still per document: it opens the PDF,
- * reads the text layer, and decides page by page what needs recognising. It is
- * cheap and mostly I/O, so it is done inline rather than given its own queue.
+ * Preparation is the step that decides, page by page, whether the PDF's own
+ * text layer can be used or whether the page has to be recognised. It is cheap
+ * -- a fraction of a second per page -- and for these documents it resolves the
+ * large majority of pages outright, so it is what actually makes an upload
+ * usable.
  */
 async function prepareNewDocuments(signal: AbortSignal) {
   const pending = await prisma.document.findMany({
-    where: { ocrStatus: { in: ['PENDING'] }, pages: { none: {} } },
+    where: { ocrStatus: 'PENDING', pages: { none: {} } },
     select: { id: true },
     orderBy: { createdAt: 'asc' },
-    take: 5,
+    take: config.prepareBatchSize,
   });
   for (const document of pending) {
-    if (signal.aborted) return;
+    if (signal.aborted) return 0;
     await prepareDocument(document.id, signal);
   }
   return pending.length;
 }
 
-/** Runs `limit` promises at a time over the claimed pages. */
+/** Runs `ocrConcurrency` pages at a time over one claimed batch. */
 async function runPages(pages: ClaimedPage[], signal: AbortSignal) {
   let next = 0;
   const runner = async () => {
@@ -85,55 +87,79 @@ async function runPages(pages: ClaimedPage[], signal: AbortSignal) {
   ));
 }
 
-async function tick(signal: AbortSignal) {
-  await prepareNewDocuments(signal);
-  if (signal.aborted) return 0;
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  const pages = await claimPages(config.pageClaimSize);
-  if (!pages.length) return 0;
-
-  console.log(`[ocr] claimed ${pages.length} page${pages.length === 1 ? '' : 's'}`);
-  const started = Date.now();
-  await runPages(pages, signal);
-  if (!signal.aborted) {
-    const seconds = (Date.now() - started) / 1000;
-    console.log(`[ocr] finished ${pages.length} page${pages.length === 1 ? '' : 's'} in ${seconds.toFixed(1)}s (${(seconds / pages.length).toFixed(2)}s/page)`);
-  }
-  return pages.length;
-}
-
-let sinceStaleSweep = 0;
-
-async function loop() {
-  const { signal } = state.controller;
+/**
+ * Reads documents' text layers, continuously and independently of recognition.
+ *
+ * These were one loop until it became clear what that cost: a pass prepared a
+ * handful of documents, then blocked on recognising their image-only pages
+ * before looking at any more. Recognition is minutes per page on a small
+ * instance, so an upload of a dozen files spent most of its life with most of
+ * those files not yet opened -- reported as PROCESSING with no pages at all --
+ * while the text that would have answered the user's search in seconds sat
+ * unread behind a handful of scanned pages.
+ *
+ * Splitting them means the cheap, high-yield work is never queued behind the
+ * expensive, rare work. The two share a CPU, but preparation is short per
+ * document and interleaves; recognition simply finishes a little later, which
+ * is the right thing to trade.
+ */
+async function prepareLoop(signal: AbortSignal) {
   while (state.running && !signal.aborted) {
     try {
-      // Recovering abandoned locks is cheap but pointless to do every pass, so
-      // it runs roughly once a minute.
-      sinceStaleSweep += config.queuePollIntervalMs;
-      if (sinceStaleSweep >= 60_000) {
-        sinceStaleSweep = 0;
-        const recovered = await releaseStalePages();
-        if (recovered) console.log(`[ocr] returned ${recovered} abandoned page(s) to the queue`);
+      const prepared = await prepareNewDocuments(signal);
+      if (prepared > 0) {
+        console.log(`[ocr] prepared ${prepared} document${prepared === 1 ? '' : 's'}`);
+        continue;
       }
-
-      const processed = await tick(signal);
-      // Chips away at pages left over from the previous pipeline. It runs only
-      // when the queue is otherwise idle, so it never delays a batch.
-      if (processed === 0 && !signal.aborted) {
-        const filled = await backfillPages(normalizeForSearch);
-        if (filled) {
-          console.log(`[ocr] upgraded ${filled} stored page(s)`);
-          continue;
-        }
-      }
-      // Straight back round while there is work; otherwise wait before asking
-      // again, so an idle worker is not polling the database in a tight loop.
-      if (processed > 0) continue;
     } catch (error) {
-      console.error('[ocr] worker pass failed:', error);
+      console.error('[ocr] preparation pass failed:', error);
     }
-    await new Promise((resolve) => setTimeout(resolve, config.queuePollIntervalMs));
+    await sleep(config.queuePollIntervalMs);
+  }
+}
+
+/** Claims and recognises the pages that no text layer could answer. */
+async function recognitionLoop(signal: AbortSignal) {
+  while (state.running && !signal.aborted) {
+    try {
+      const pages = await claimPages(config.pageClaimSize);
+      if (pages.length) {
+        const started = Date.now();
+        await runPages(pages, signal);
+        if (!signal.aborted) {
+          const seconds = (Date.now() - started) / 1000;
+          console.log(`[ocr] recognised ${pages.length} page${pages.length === 1 ? '' : 's'} in ${seconds.toFixed(1)}s (${(seconds / pages.length).toFixed(1)}s/page)`);
+        }
+        continue;
+      }
+    } catch (error) {
+      console.error('[ocr] recognition pass failed:', error);
+    }
+    await sleep(config.queuePollIntervalMs);
+  }
+}
+
+/**
+ * Housekeeping: recovering pages from workers that vanished, and upgrading rows
+ * the previous pipeline wrote. Both are slow-moving and neither may hold up the
+ * two loops above, so they get their own.
+ */
+async function maintenanceLoop(signal: AbortSignal) {
+  while (state.running && !signal.aborted) {
+    try {
+      const recovered = await releaseStalePages();
+      if (recovered) console.log(`[ocr] recovered ${recovered} abandoned page(s)`);
+      const upgraded = await backfillPages(normalizeForSearch);
+      if (upgraded) {
+        console.log(`[ocr] upgraded ${upgraded} stored page(s)`);
+        continue;
+      }
+    } catch (error) {
+      console.error('[ocr] maintenance pass failed:', error);
+    }
+    await sleep(60_000);
   }
 }
 
@@ -145,7 +171,14 @@ export function startOcrWorker() {
     `[ocr] worker started: ${config.ocrConcurrency} recognition slot(s), `
     + `${config.renderConcurrency} renderer(s), claiming ${config.pageClaimSize} page(s) at a time`,
   );
-  state.loop = loop();
+  const { signal } = state.controller;
+  // Preparation, recognition and housekeeping run independently, so none of
+  // them can be held up behind another.
+  state.loop = Promise.all([
+    prepareLoop(signal),
+    recognitionLoop(signal),
+    maintenanceLoop(signal),
+  ]).then(() => undefined);
 }
 
 /**

@@ -101,27 +101,55 @@ const cpuCount = (() => {
   return Number.isFinite(limit) ? Math.max(1, Math.min(reported, Math.floor(limit))) : reported;
 })();
 
+/**
+ * The memory this container is actually allowed, or Infinity when uncapped.
+ *
+ * `freemem()` reports the *host's* free memory, which on a platform that caps a
+ * container through cgroups (Render, Fly, ECS) is tens of gigabytes while the
+ * service itself may have two. Sizing the recognition pool from it is the same
+ * mistake as sizing it from the host's core count: the process cheerfully
+ * starts more daemons than fit and is then killed by the OOM reaper, or spends
+ * its time swapping -- which looks like a service that has become inexplicably
+ * slow rather than one that is out of memory.
+ */
+function cgroupMemoryLimit() {
+  const read = (path: string) => {
+    try { return readFileSync(path, 'utf8').trim(); } catch { return undefined; }
+  };
+  // cgroup v2, then v1.
+  const raw = read('/sys/fs/cgroup/memory.max') ?? read('/sys/fs/cgroup/memory/memory.limit_in_bytes');
+  if (!raw || raw === 'max') return Number.POSITIVE_INFINITY;
+  const limit = Number(raw);
+  // cgroup v1 reports an enormous sentinel value when nothing is set.
+  if (!Number.isFinite(limit) || limit <= 0 || limit > 1024 ** 4) return Number.POSITIVE_INFINITY;
+  return limit;
+}
+
 // Each recognition daemon holds the PP-OCRv5 models plus its ONNX Runtime
 // arena, measured at roughly 360 MB resident and flat across pages. The budget
 // is rounded up from that so a container is never sized into the OOM reaper.
 const WORKER_MEMORY_BUDGET = 420 * 1024 * 1024;
+
+/**
+ * What is left for recognition after everything else this process does.
+ *
+ * Reading a document is itself expensive -- an eight-page broadsheet peaks
+ * around 600 MB while its thirty thousand word boxes are being built -- so that
+ * has to be reserved before any daemon is allowed to exist, not discovered
+ * afterwards when the two collide.
+ */
+const NODE_MEMORY_RESERVE = 700 * 1024 * 1024;
 const usableMemory = (() => {
+  const limit = cgroupMemoryLimit();
   const available = (globalThis as { process?: { availableMemory?: () => number } }).process?.availableMemory;
   const free = typeof available === 'function' ? available() : freemem();
-  // Leave room for Node itself, Poppler, and the rest of the host.
-  return Math.max(0, Math.min(free, totalmem()) - 320 * 1024 * 1024);
+  // The cgroup cap wins wherever there is one; it is the only figure that
+  // describes this container rather than the machine underneath it.
+  const ceiling = Number.isFinite(limit) ? limit : Math.min(free, totalmem());
+  return Math.max(0, ceiling - NODE_MEMORY_RESERVE);
 })();
 const memoryBoundConcurrency = Math.max(1, Math.floor(usableMemory / WORKER_MEMORY_BUDGET));
 
-/**
- * How many pages are recognised at once.
- *
- * This used to be `cpuCount - 1`, which evaluates to zero -- and is then
- * clamped to one -- on every single-CPU plan, so production ran one page at a
- * time however much work was queued while a developer laptop ran eight. OCR
- * now lives in its own service with no HTTP traffic to protect, so the whole
- * CPU allowance is used and a one-core plan is described honestly as one page.
- */
 /**
  * Whether this process reads the queue itself.
  *
@@ -240,10 +268,24 @@ export const config = {
   pageClaimSize: positiveInteger(process.env.OCR_PAGE_CLAIM_SIZE, Math.max(4, ocrConcurrency * 2), 64),
   maxPageAttempts: positiveInteger(process.env.OCR_MAX_PAGE_ATTEMPTS, 3, 10),
   queuePollIntervalMs: positiveInteger(process.env.OCR_POLL_INTERVAL_MS, 2_000),
+  // Documents opened per preparation pass. Preparation is cheap and resolves
+  // most pages outright, so this is deliberately larger than it looks: the
+  // sooner a batch is read, the sooner it can be searched.
+  prepareBatchSize: positiveInteger(process.env.OCR_PREPARE_BATCH_SIZE, 10, 50),
   // A page still marked as running after this long belongs to a worker that
   // was redeployed or killed, and is offered to the pool again.
   staleLockMs: positiveInteger(process.env.OCR_STALE_LOCK_MS, 10 * 60_000),
   documentCacheEntries: positiveInteger(process.env.OCR_PDF_CACHE_ENTRIES, 4, 32),
+  /**
+   * How long an unused recognition daemon is kept alive.
+   *
+   * Each holds about 360 MB, and on these documents most pages are served from
+   * the text layer and never reach one -- so a pool that has been used once and
+   * then idles was permanently holding memory the document reader needed. They
+   * are cheap to restart (models load in about a fifth of a second), so idle
+   * ones are released and re-created on demand.
+   */
+  ocrIdleTimeoutMs: positiveInteger(process.env.PPOCR_IDLE_TIMEOUT_MS, 90_000),
   runWorkerInProcess,
 
   uploadStorageConcurrency: positiveInteger(process.env.UPLOAD_STORAGE_CONCURRENCY, 4, 8),

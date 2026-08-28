@@ -86,12 +86,30 @@ export async function prepareDocument(documentId: string, signal: AbortSignal) {
     // A re-run replaces whatever the previous attempt left behind.
     await prisma.ocrPage.deleteMany({ where: { documentId } });
 
-    const rows: Prisma.OcrPageCreateManyInput[] = [];
+    // Pages are written as they are read, a chunk at a time, and dropped.
+    //
+    // Holding the whole document first was the single largest memory cost in
+    // the service: a broadsheet page carries about five thousand word boxes, so
+    // an eight-page issue peaked near 600 MB before anything was stored, and a
+    // hundred-page PDF had no chance at all. On a 2 GB container that collided
+    // with the recognition daemons and left the process swapping -- which shows
+    // up as pages taking minutes each, with no obvious culprit, even for
+    // documents that never reach the recogniser.
+    //
+    // Chunking still costs one statement per twenty-five pages rather than one
+    // per page, which is what matters over a pooled Neon connection.
+    let chunk: Prisma.OcrPageCreateManyInput[] = [];
+    const flush = async () => {
+      if (!chunk.length) return;
+      await prisma.ocrPage.createMany({ data: chunk });
+      chunk = [];
+    };
+
     for (let pageNumber = 1; pageNumber <= pdf.pageCount; pageNumber += 1) {
       if (signal.aborted) return;
       const page = await pdf.readPage(pageNumber, { withText: !forceOcr });
       const usable = !forceOcr && embeddedTextIsUsable(page);
-      rows.push({
+      chunk.push({
         documentId,
         pageNumber,
         width: page.width,
@@ -102,13 +120,9 @@ export async function prepareDocument(documentId: string, signal: AbortSignal) {
         words: (usable ? compactWords(page.words) : []) as unknown as Prisma.InputJsonValue,
         status: usable ? 'COMPLETE' : 'PENDING',
       });
+      if (chunk.length >= PAGE_DB_CHUNK) await flush();
     }
-
-    // One statement per chunk rather than per page: over a pooled Neon
-    // connection that is the difference between a round trip and hundreds.
-    for (let index = 0; index < rows.length; index += PAGE_DB_CHUNK) {
-      await prisma.ocrPage.createMany({ data: rows.slice(index, index + PAGE_DB_CHUNK) });
-    }
+    await flush();
     await refreshDocumentStatus(documentId);
   } catch (error) {
     if (signal.aborted) return;
