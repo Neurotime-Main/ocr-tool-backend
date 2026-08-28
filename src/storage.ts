@@ -45,7 +45,10 @@ export class LocalFileStorage implements FileStorage {
     // first, naming a path that says nothing about the cause.
     await access(source).catch(() => {
       throw new Error(
-        'The stored PDF is missing. A local storage directory is erased when the host restarts or redeploys; set STORAGE_DRIVER=spaces so uploads outlive a deploy.',
+        'The stored PDF is missing, because STORAGE_DRIVER is set to \'local\'. The API and the OCR '
+        + 'worker are separate services with separate disks, so the worker cannot read a file the API '
+        + 'wrote locally, and the disk is erased on every deploy in any case. Set STORAGE_DRIVER=spaces '
+        + '(with the DO_SPACES_* variables) on BOTH services.',
       );
     });
     return source;

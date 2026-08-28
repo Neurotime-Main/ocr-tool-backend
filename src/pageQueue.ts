@@ -221,3 +221,54 @@ export async function backfillPages(normalize: (value: string) => string, batchS
   })));
   return pending.length;
 }
+
+export type QueueHealth = {
+  pendingPages: number;
+  processingPages: number;
+  oldestPendingSeconds: number | null;
+  lastClaimSeconds: number | null;
+  stalled: boolean;
+};
+
+/**
+ * Reports whether anything is actually draining the queue.
+ *
+ * Recognition runs in its own service, so the API can be perfectly healthy
+ * while no worker exists at all -- and the only symptom is that documents stay
+ * PENDING forever, with nothing anywhere saying why. There is no heartbeat
+ * table, but `startedAt` is written every time a page is claimed, so the most
+ * recent claim stands in for "a worker is alive". Work waiting while nothing
+ * has been claimed for minutes is the signature of a worker that is missing,
+ * crash-looping, or pointed at the wrong database.
+ */
+export async function getQueueHealth(): Promise<QueueHealth> {
+  const [pendingPages, processingPages, oldest, lastClaim] = await Promise.all([
+    prisma.ocrPage.count({ where: { status: 'PENDING' } }),
+    prisma.ocrPage.count({ where: { status: 'PROCESSING' } }),
+    prisma.ocrPage.findFirst({
+      where: { status: 'PENDING' },
+      select: { createdAt: true },
+      orderBy: { createdAt: 'asc' },
+    }),
+    prisma.ocrPage.findFirst({
+      where: { startedAt: { not: null } },
+      select: { startedAt: true },
+      orderBy: { startedAt: 'desc' },
+    }),
+  ]);
+
+  const secondsSince = (date: Date | null | undefined) =>
+    date ? Math.round((Date.now() - date.getTime()) / 1000) : null;
+  const oldestPendingSeconds = secondsSince(oldest?.createdAt);
+  const lastClaimSeconds = secondsSince(lastClaim?.startedAt);
+
+  return {
+    pendingPages,
+    processingPages,
+    oldestPendingSeconds,
+    lastClaimSeconds,
+    stalled: pendingPages > 0
+      && (oldestPendingSeconds ?? 0) > 120
+      && (lastClaimSeconds === null || lastClaimSeconds > 120),
+  };
+}

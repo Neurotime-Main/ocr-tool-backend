@@ -10,6 +10,7 @@ import { checkOcrEngine } from './ocrEngine.js';
 import { checkRenderer } from './render.js';
 import { ensureWorkerDirectories, startOcrWorker, stopOcrWorker } from './ocrWorker.js';
 import { getOcrProgress, requeueDocument } from './documents.js';
+import { getQueueHealth } from './pageQueue.js';
 import { addHighlightsToPdf } from './exportPdf.js';
 import { createFindingsWorkbook } from './excelReport.js';
 import { documentIdsSchema, documentSearchSchema, highlightListSchema } from './validation.js';
@@ -105,11 +106,12 @@ app.get('/api/health', async (_request, response) => {
   // the service cannot work without. A broken bucket policy, a wrong region, or
   // an image missing the OCR binary then fails the deploy instead of surfacing
   // on a user's first upload.
-  const [database, storageStatus, ocrEngine, renderer] = await Promise.all([
+  const [database, storageStatus, ocrEngine, renderer, queue] = await Promise.all([
     prisma.$queryRaw`SELECT 1`.then(() => 'connected' as const).catch(() => 'unavailable' as const),
     storage.check(),
     checkOcrEngine(),
     checkRenderer(),
+    getQueueHealth().catch(() => null),
   ]);
   const ok = database === 'connected' && storageStatus.ok && ocrEngine.ok && renderer.ok;
   response.status(ok ? 200 : 503).json({
@@ -128,6 +130,19 @@ app.get('/api/health', async (_request, response) => {
       ok: renderer.ok,
       ...(renderer.ok ? { engine: renderer.detail } : { error: renderer.detail }),
     },
+    // Reported but deliberately not part of `ok`: a stalled queue is a problem
+    // with the worker service, and failing the API's health check over it would
+    // take the API down too, which helps nobody.
+    ...(queue ? {
+      queue: {
+        ...queue,
+        ...(queue.stalled ? {
+          warning: 'Pages are waiting but nothing has claimed one recently. Check that the '
+            + 'markwise-ocr-worker service is running, points at this DATABASE_URL, and has the '
+            + 'DO_SPACES_* variables set.',
+        } : {}),
+      },
+    } : {}),
   });
 });
 

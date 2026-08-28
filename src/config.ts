@@ -40,6 +40,19 @@ export function assertRuntimeEnvironment() {
       `STORAGE_DRIVER=spaces requires ${missing.join(', ')}. Set them on the service, or use STORAGE_DRIVER=local for a machine with a persistent disk.`,
     );
   }
+  // The API and the recognition worker are separate containers with separate
+  // ephemeral disks, so a PDF the API writes locally is a file the worker can
+  // never open. That used to work only because both ran in one process. This is
+  // fatal at boot rather than on the first page, because otherwise the symptom
+  // is every page of every upload failing with a message about a missing file.
+  if (process.env.NODE_ENV === 'production' && !isSpacesDriver(process.env.STORAGE_DRIVER)) {
+    throw new Error(
+      `STORAGE_DRIVER is '${process.env.STORAGE_DRIVER ?? 'local'}', which cannot work in production: `
+      + 'the API and the OCR worker run as separate services and do not share a disk, so the worker '
+      + 'cannot read the PDFs the API stores. Set STORAGE_DRIVER=spaces together with DO_SPACES_BUCKET, '
+      + 'DO_SPACES_ENDPOINT, DO_SPACES_REGION, DO_SPACES_KEY and DO_SPACES_SECRET on BOTH services.',
+    );
+  }
   if (process.env.NODE_ENV === 'production' && !process.env.CLIENT_ORIGIN) {
     throw new Error(
       'CLIENT_ORIGIN is missing. Set it to your Vercel origin, for example https://markwise.vercel.app (comma-separated for several, and https://markwise-*.vercel.app for previews).',
