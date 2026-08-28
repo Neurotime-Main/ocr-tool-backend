@@ -22,18 +22,16 @@ services:
     # OCR keeps working through a deploy until the in-flight pages are handed
     # back to the queue.
     maxShutdownDelaySeconds: 120
-    # Two CPUs is the floor worth deploying.
+    # Two CPUs is the floor worth deploying for production batches.
     #
-    # Recognition is CPU bound and one page uses one core, and this service also
-    # has to answer HTTP -- so one core is held back for that, and a 1-CPU plan
-    # would leave exactly zero for OCR (it is clamped to one, but then every
-    # request competes with it and the health check can time out). On `standard`
-    # one page is recognised at a time; `pro` (4 GB / 2 CPU) gives two.
+    # Recognition is CPU bound and one page uses one core. Render `standard` is
+    # only 1 CPU / 2 GB and therefore reads one page at a time. `pro` is the
+    # legacy name for the 2 CPU / 4 GB (`2c-4g`) plan and reads two at once.
     #
     # Most pages never reach the recogniser at all -- anything with a usable
     # text layer is read directly, which for typical publication PDFs is the
     # large majority -- so this matters most for scanned, image-only documents.
-    plan: standard
+    plan: pro
     envVars:
       - key: NODE_ENV
         value: production
@@ -93,8 +91,11 @@ services:
       # Everything below is optional; the defaults are sized from the CPU and
       # memory the container is actually given.
       #
-      # OCR_CONCURRENCY      pages recognised at once (default: cores - 1)
+      # OCR_CONCURRENCY      pages recognised at once (default: CPU quota)
       # OCR_RENDER_DPI       rasterisation DPI (default 200)
       # PPOCR_DET_MAX_SIDE   detector input size; 1600 reads dense body copy,
       #                      1280 is ~a third faster and loses the smallest text
-      # RUN_OCR_IN_API       set to false only once a worker service exists
+      - key: RUN_OCR_IN_API
+        value: true
+      - key: OCR_QUEUE_NAMESPACE
+        value: production

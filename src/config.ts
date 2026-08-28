@@ -30,6 +30,7 @@ export function assertRuntimeEnvironment() {
   if (isSpacesDriver(process.env.STORAGE_DRIVER)) {
     if (!process.env.DO_SPACES_BUCKET) missing.push('DO_SPACES_BUCKET');
     if (!process.env.DO_SPACES_ENDPOINT) missing.push('DO_SPACES_ENDPOINT');
+    if (!process.env.DO_SPACES_REGION) missing.push('DO_SPACES_REGION');
     // Spaces has no instance roles or metadata service, so a key pair is the
     // only way to authenticate; there is no provider chain to fall back to.
     if (!process.env.DO_SPACES_KEY) missing.push('DO_SPACES_KEY');
@@ -92,13 +93,15 @@ function cgroupCpuLimit() {
 
 // Recognition is CPU bound, so the useful amount of parallel work is set by
 // the number of cores the container is actually scheduled for.
+const reportedCpuCount = (() => {
+  try { return availableParallelism(); } catch { return 2; }
+})();
+const cpuQuota = cgroupCpuLimit();
 const cpuCount = (() => {
-  const reported = (() => {
-    try { return availableParallelism(); } catch { return 2; }
-  })();
-  const limit = cgroupCpuLimit();
   // A fractional allowance still runs one page, just not two at once.
-  return Number.isFinite(limit) ? Math.max(1, Math.min(reported, Math.floor(limit))) : reported;
+  return Number.isFinite(cpuQuota)
+    ? Math.max(1, Math.min(reportedCpuCount, Math.floor(cpuQuota)))
+    : reportedCpuCount;
 })();
 
 /**
@@ -139,13 +142,13 @@ const WORKER_MEMORY_BUDGET = 420 * 1024 * 1024;
  * afterwards when the two collide.
  */
 const NODE_MEMORY_RESERVE = 700 * 1024 * 1024;
+const memoryLimit = cgroupMemoryLimit();
 const usableMemory = (() => {
-  const limit = cgroupMemoryLimit();
   const available = (globalThis as { process?: { availableMemory?: () => number } }).process?.availableMemory;
   const free = typeof available === 'function' ? available() : freemem();
   // The cgroup cap wins wherever there is one; it is the only figure that
   // describes this container rather than the machine underneath it.
-  const ceiling = Number.isFinite(limit) ? limit : Math.min(free, totalmem());
+  const ceiling = Number.isFinite(memoryLimit) ? memoryLimit : Math.min(free, totalmem());
   return Math.max(0, ceiling - NODE_MEMORY_RESERVE);
 })();
 const memoryBoundConcurrency = Math.max(1, Math.floor(usableMemory / WORKER_MEMORY_BUDGET));
@@ -165,16 +168,23 @@ const runWorkerInProcess = (process.env.RUN_OCR_IN_API ?? 'true') !== 'false';
 /**
  * How many pages are recognised at once.
  *
- * A dedicated worker serves no HTTP and can use every core. Sharing the process
- * with the API cannot: recognition would starve the health check that Render
- * gates deploys on, turning a slow batch into a restart loop. So a core is held
- * back in that case -- which on a single-CPU plan honestly means one page at a
- * time, and is the reason to move to two cores before anything else.
+ * The recognisers are child processes, so the OS scheduler still gives the
+ * lightweight Node HTTP process time while they are busy. Reserving a whole
+ * core here made a 2-CPU Render plan run only one single-threaded recogniser,
+ * leaving half of the plan idle. Memory remains an independent hard cap.
  */
-const usableCores = runWorkerInProcess ? Math.max(1, cpuCount - 1) : cpuCount;
-const defaultOcrConcurrency = Math.max(1, Math.min(8, usableCores, memoryBoundConcurrency));
+const defaultOcrConcurrency = Math.max(1, Math.min(8, cpuCount, memoryBoundConcurrency));
 
-const ocrConcurrency = positiveInteger(process.env.OCR_CONCURRENCY, defaultOcrConcurrency, 32);
+const requestedOcrConcurrency = positiveInteger(process.env.OCR_CONCURRENCY, defaultOcrConcurrency, 32);
+// An old dashboard override must not defeat the cgroup sizing and turn a small
+// instance into an oversubscribed/OOMing one.
+const ocrConcurrency = Math.max(1, Math.min(requestedOcrConcurrency, cpuCount, memoryBoundConcurrency));
+const requestedRenderConcurrency = positiveInteger(
+  process.env.OCR_RENDER_CONCURRENCY,
+  Math.max(1, Math.ceil(ocrConcurrency / 2)),
+  32,
+);
+const renderConcurrency = Math.max(1, Math.min(requestedRenderConcurrency, cpuCount));
 
 export const config = {
   port: Number(process.env.PORT ?? 4000),
@@ -253,14 +263,21 @@ export const config = {
 
   // --- Throughput ---------------------------------------------------------
   ocrConcurrency,
+  runtimeResources: {
+    reportedCpuCount,
+    // Preserve a fractional cgroup allowance: Render Free is 0.1 CPU, not one
+    // CPU, even though at least one job still has to be allowed to run.
+    cpuQuota: Number.isFinite(cpuQuota) ? cpuQuota : null,
+    schedulableCpuCount: cpuCount,
+    memoryLimitBytes: Number.isFinite(memoryLimit) ? memoryLimit : null,
+    memoryBoundConcurrency,
+    requestedOcrConcurrency,
+    requestedRenderConcurrency,
+  },
   // Poppler competes with the recogniser for the same cores, so rendering runs
   // at roughly half the recognition width and is overlapped with it. JPEG
   // output made rasterising cheap enough that it is no longer the limit.
-  renderConcurrency: positiveInteger(
-    process.env.OCR_RENDER_CONCURRENCY,
-    Math.max(1, Math.min(cpuCount, Math.ceil(ocrConcurrency / 2))),
-    32,
-  ),
+  renderConcurrency,
 
   // --- Page queue ---------------------------------------------------------
   // Pages are claimed in runs so one PDF is opened and downloaded once per
@@ -276,6 +293,11 @@ export const config = {
   // was redeployed or killed, and is offered to the pool again.
   staleLockMs: positiveInteger(process.env.OCR_STALE_LOCK_MS, 10 * 60_000),
   documentCacheEntries: positiveInteger(process.env.OCR_PDF_CACHE_ENTRIES, 4, 32),
+  // A local dev process and Render may point at the same Neon database, but
+  // they do not share local files or compute. Keep their queues separate.
+  queueNamespace: process.env.OCR_QUEUE_NAMESPACE
+    ?? (process.env.NODE_ENV === 'production' ? 'production' : 'development'),
+  prepareStaleMs: positiveInteger(process.env.OCR_PREPARE_STALE_MS, 10 * 60_000),
   /**
    * How long an unused recognition daemon is kept alive.
    *
@@ -309,6 +331,9 @@ export function describeRuntime(role: 'api' | 'worker') {
     `nodeEnv=${process.env.NODE_ENV ?? '(unset)'}`,
     `storage=${config.storageDriver}${isSpacesDriver(config.storageDriver) ? `:${config.spaces.bucket}` : `:${config.storageDir}`}`,
     `workerInApi=${config.runWorkerInProcess}`,
+    `queueNamespace=${config.queueNamespace}`,
+    `cpuQuota=${config.runtimeResources.cpuQuota ?? 'unlimited'}`,
+    `memoryLimitMb=${config.runtimeResources.memoryLimitBytes == null ? 'unlimited' : Math.round(config.runtimeResources.memoryLimitBytes / 1024 / 1024)}`,
     `ocrConcurrency=${config.ocrConcurrency}`,
     `renderConcurrency=${config.renderConcurrency}`,
     `python=${config.pythonBin}`,

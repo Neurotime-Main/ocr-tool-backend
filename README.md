@@ -49,7 +49,7 @@ Recognition is CPU bound and each page uses one core, so **pages in parallel is 
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `OCR_CONCURRENCY` | smaller of the container's CPU quota and free memory ÷ 420 MB, capped at 8 | Pages recognised at once. "CPU" is the cgroup quota where one is set, not the host's core count. |
+| `OCR_CONCURRENCY` | smaller of the container's CPU quota and free memory ÷ 420 MB, capped at 8 | Pages recognised at once. "CPU" is the cgroup quota where one is set, not the host's core count. A 2-CPU plan defaults to two. |
 | `OCR_RENDER_CONCURRENCY` | half of `OCR_CONCURRENCY` | Parallel Poppler rasterisations, overlapped with recognition. |
 | `OCR_RENDER_DPI` | `200` | Rasterisation DPI. PP-OCRv5 downsamples again before detection, so higher values mostly cost time. |
 | `PPOCR_DET_MAX_SIDE` | `1600` | Longest side the text detector sees. This is the accuracy control for dense pages: 1600 finds broadsheet body copy; 1280 is roughly a third faster and loses the smallest text. |
@@ -57,7 +57,7 @@ Recognition is CPU bound and each page uses one core, so **pages in parallel is 
 | `OCR_MAX_PAGE_PIXELS` | `12000000` | Ceiling on one rendered page; oversized page boxes render below `OCR_RENDER_DPI`. |
 | `OCR_MAX_PAGE_ATTEMPTS` | `3` | Attempts before a page is given up on. |
 | `OCR_STALE_LOCK_MS` | `600000` | How long a claimed page may be silent before another worker may take it. |
-| `RUN_OCR_IN_API` | `false` in production | Runs the worker inside the API process. On by default in development so `npm run dev` is one command. |
+| `RUN_OCR_IN_API` | `true` | Runs the worker inside the API process. Leave it on for the one-service deployment in `render.yaml`; set it to false only after creating a separate worker. |
 
 ### Why PaddleOCR, and why not Tesseract
 
@@ -144,8 +144,9 @@ the queue, and prints the exact command that fixes whatever is broken.
 
 1. **New → Web Service**, point it at this repository, **Runtime: Docker**,
    root directory `backend`, health check path `/api/health`.
-2. **Plan: Standard or better.** One page is recognised per CPU core, and one
-   core is reserved for HTTP, so a 1-CPU plan leaves nothing for OCR.
+2. **Plan: Pro / `2c-4g` or better.** PaddleOCR is CPU-bound. Render Standard
+   is only 1 CPU / 2 GB and processes one page at a time; Pro is 2 CPU / 4 GB
+   and processes two. Free is 0.1 CPU and is unsuitable for OCR.
 3. Set the environment variables below.
 4. Deploy. The container runs `prisma migrate deploy` before starting, so the
    schema is applied for you.
@@ -166,7 +167,8 @@ the queue, and prints the exact command that fixes whatever is broken.
 | `DO_SPACES_FORCE_PATH_STYLE` | `true` | no |
 | `DO_SPACES_DISABLE_CHECKSUMS` | `true` — Spaces rejects the SDK's chunked framing | no |
 | `MAX_BATCH_FILES` / `MAX_UPLOAD_MB` | `30` / `50` | no |
-| `OCR_CONCURRENCY` | pages at once; defaults to cores − 1 | no |
+| `OCR_CONCURRENCY` | pages at once; defaults to whole cgroup CPU quota, memory-capped | no |
+| `OCR_QUEUE_NAMESPACE` | `production` on Render, `development` locally; prevents workers sharing a database from claiming each other's files | no |
 | `PPOCR_DET_MAX_SIDE` | `1600`; lower to `1280` for ~⅓ faster, less small text | no |
 | `NODE_ENV` | set by the Dockerfile | no |
 
@@ -183,7 +185,7 @@ The process refuses to start without it rather than losing uploads later.
 | *The OCR engine could not be started* | No Python, or `PYTHON_BIN` points nowhere | Locally `npm run setup:python`. On Render this means the service is not the Docker image. |
 | *The PDF page renderer is not installed* | No Poppler | Same cause as above: not built from the Dockerfile. |
 | Health check fails on deploy | A dependency is down | The `/api/health` body names which one. |
-| Batch is slow, CPU pinned | Too few cores | Raise the plan, or lower `PPOCR_DET_MAX_SIDE` to `1280`. |
+| Batch is slow, CPU pinned | Too few cores | `/api/health` reports the actual `runtime.cpuQuota`. Free is 0.1 CPU, Standard is 1, and Pro is 2. Use Pro for production batches, or lower `PPOCR_DET_MAX_SIDE` to `1280`. |
 | Deploy killed a running batch | Normal | In-flight pages return to the queue and resume. Nothing is lost. |
 
 ### Scaling up

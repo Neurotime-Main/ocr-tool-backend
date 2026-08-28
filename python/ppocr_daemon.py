@@ -25,18 +25,24 @@ import numpy as np
 import onnxruntime as ort
 import pyclipper
 import yaml
-from shapely.geometry import Polygon
 
 MODEL_DIR = os.environ.get("PPOCR_MODEL_DIR", "/app/models")
 # One thread by default: the Node worker runs several pages at once and sizing
 # both pools from the same cores would only make them fight over the CPU.
 THREADS = max(1, int(os.environ.get("PPOCR_THREADS", "1")))
+MAX_CANDIDATES = max(100, int(os.environ.get("PPOCR_MAX_CANDIDATES", "1000")))
 DET_LIMIT = max(320, int(os.environ.get("PPOCR_DET_MAX_SIDE", "1600")))
 DET_THRESH = float(os.environ.get("PPOCR_DET_THRESH", "0.3"))
 DET_BOX_THRESH = float(os.environ.get("PPOCR_DET_BOX_THRESH", "0.6"))
 DET_UNCLIP = float(os.environ.get("PPOCR_DET_UNCLIP", "1.5"))
 REC_MIN_SCORE = float(os.environ.get("PPOCR_REC_MIN_SCORE", "0.45"))
 USE_ANGLE_CLS = os.environ.get("PPOCR_USE_ANGLE_CLS", "1") != "0"
+
+# OpenCV sees the physical host's cores on some container platforms instead of
+# the cgroup quota. Its default pool can therefore create dozens of threads for
+# a daemon that is allotted one CPU, multiplying context switching across every
+# concurrent page. Page-level parallelism is owned by the Node worker.
+cv2.setNumThreads(THREADS)
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], np.float32)
@@ -98,25 +104,34 @@ class Detector:
 
         mask = (probability > DET_THRESH).astype(np.uint8)
         contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        # PaddleOCR's own DB post-process caps candidates too. Prefer the
+        # largest regions when a noisy page creates more contours than the cap.
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:MAX_CANDIDATES]
         boxes = []
-        for contour in contours[:3000]:
+        for contour in contours:
             if len(contour) < 4:
                 continue
             rectangle = cv2.minAreaRect(contour)
             if min(rectangle[1]) < 3:
                 continue
-            # Mean probability inside the contour is the box's own score.
-            score_mask = np.zeros(probability.shape, np.uint8)
-            cv2.fillPoly(score_mask, [contour.astype(np.int32)], 1)
-            score = cv2.mean(probability, score_mask)[0]
+            # Mean probability inside the contour is the box's own score. The
+            # old implementation allocated and scanned a full detector-sized
+            # mask for every contour (up to 3000 full-page scans). Score only
+            # the contour's bounding crop, as PaddleOCR's fast path does.
+            x, y, box_width, box_height = cv2.boundingRect(contour)
+            score_mask = np.zeros((box_height, box_width), np.uint8)
+            shifted = contour.reshape(-1, 2) - np.array([x, y])
+            cv2.fillPoly(score_mask, [shifted.astype(np.int32)], 1)
+            score = cv2.mean(probability[y:y + box_height, x:x + box_width], score_mask)[0]
             if score < DET_BOX_THRESH:
                 continue
             corners = cv2.boxPoints(rectangle)
-            polygon = Polygon(corners)
-            if polygon.area < 1:
+            area = abs(cv2.contourArea(corners))
+            perimeter = cv2.arcLength(corners, True)
+            if area < 1 or perimeter <= 0:
                 continue
             # DB shrinks every region during training, so it is grown back here.
-            distance = polygon.area * DET_UNCLIP / max(polygon.length, 1e-6)
+            distance = area * DET_UNCLIP / perimeter
             offset = pyclipper.PyclipperOffset()
             offset.AddPath(corners.astype(np.int64).tolist(), pyclipper.JT_ROUND, pyclipper.ET_CLOSEDPOLYGON)
             expanded = offset.Execute(distance)

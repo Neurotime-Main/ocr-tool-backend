@@ -43,17 +43,44 @@ const state: WorkerState = {
  * usable.
  */
 async function prepareNewDocuments(signal: AbortSignal) {
+  const staleBefore = new Date(Date.now() - config.prepareStaleMs);
   const pending = await prisma.document.findMany({
-    where: { ocrStatus: 'PENDING', pages: { none: {} } },
+    where: {
+      queueNamespace: config.queueNamespace,
+      preparedAt: null,
+      OR: [
+        { ocrStatus: 'PENDING' },
+        // A deploy or OOM kill can stop after PROCESSING is written but before
+        // the first page row. Recover that otherwise-permanent stranded state.
+        { ocrStatus: 'PROCESSING', updatedAt: { lt: staleBefore } },
+      ],
+    },
     select: { id: true },
     orderBy: { createdAt: 'asc' },
     take: config.prepareBatchSize,
   });
+  let claimed = 0;
   for (const document of pending) {
     if (signal.aborted) return 0;
+    // Several workers can see the same candidate. Only the one whose guarded
+    // update succeeds owns this preparation attempt.
+    const ownership = await prisma.document.updateMany({
+      where: {
+        id: document.id,
+        queueNamespace: config.queueNamespace,
+        preparedAt: null,
+        OR: [
+          { ocrStatus: 'PENDING' },
+          { ocrStatus: 'PROCESSING', updatedAt: { lt: staleBefore } },
+        ],
+      },
+      data: { ocrStatus: 'PROCESSING', ocrError: null },
+    });
+    if (!ownership.count) continue;
+    claimed += 1;
     await prepareDocument(document.id, signal);
   }
-  return pending.length;
+  return claimed;
 }
 
 /** Runs `ocrConcurrency` pages at a time over one claimed batch. */

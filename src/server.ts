@@ -138,6 +138,25 @@ app.get('/api/health', async (_request, response) => {
       ok: renderer.ok,
       ...(renderer.ok ? { engine: renderer.detail } : { error: renderer.detail }),
     },
+    runtime: {
+      workerInApi: config.runWorkerInProcess,
+      queueNamespace: config.queueNamespace,
+      cpuQuota: config.runtimeResources.cpuQuota,
+      memoryLimitMb: config.runtimeResources.memoryLimitBytes == null
+        ? null
+        : Math.round(config.runtimeResources.memoryLimitBytes / 1024 / 1024),
+      ocrConcurrency: config.ocrConcurrency,
+      renderConcurrency: config.renderConcurrency,
+      ...((config.runtimeResources.requestedOcrConcurrency > config.ocrConcurrency
+        || config.runtimeResources.requestedRenderConcurrency > config.renderConcurrency)
+        ? {
+          concurrencyWarning: 'Configured OCR concurrency was clamped to the container CPU/memory limit.',
+        }
+        : {}),
+      ...(config.runtimeResources.cpuQuota != null && config.runtimeResources.cpuQuota < 1
+        ? { warning: 'This service has less than one CPU. PaddleOCR is CPU-bound; use at least 1 CPU for testing and 2 CPUs for production batches.' }
+        : {}),
+    },
     // Reported but deliberately not part of `ok`: a stalled queue is a problem
     // with the worker service, and failing the API's health check over it would
     // take the API down too, which helps nobody.
@@ -145,9 +164,9 @@ app.get('/api/health', async (_request, response) => {
       queue: {
         ...queue,
         ...(queue.stalled ? {
-          warning: 'Pages are waiting but nothing has claimed one recently. Check that the '
-            + 'markwise-ocr-worker service is running, points at this DATABASE_URL, and has the '
-            + 'DO_SPACES_* variables set.',
+          warning: config.runWorkerInProcess
+            ? 'OCR work is waiting but the in-process worker has not made progress recently. Check the Render log for a preparation or worker crash.'
+            : 'OCR work is waiting but nothing has made progress recently. Check that the separate worker is running, points at this DATABASE_URL, and has the same DO_SPACES_* variables.',
         } : {}),
       },
     } : {}),
@@ -176,6 +195,7 @@ app.post('/api/documents', upload.single('file'), async (request, response, next
         size: request.file.size,
         ocrLanguage: language,
         ocrMode,
+        queueNamespace: config.queueNamespace,
       },
     });
     response.status(201).json(document);
@@ -213,6 +233,7 @@ app.post('/api/documents/batch', upload.array('files', config.maxBatchFiles), as
             size: file.size,
             ocrLanguage: language,
             ocrMode,
+            queueNamespace: config.queueNamespace,
           },
         });
         return { document, storageKey, error: undefined };

@@ -86,7 +86,7 @@ try {
   // This command does not itself read the queue, so waiting pages only mean the
   // server is not running right now -- which during setup is the normal case.
   add('Page queue', queue.stalled ? 'warn' : 'ok',
-    `${queue.pendingPages} pending, ${queue.processingPages} running`
+    `${queue.unpreparedDocuments} unprepared documents, ${queue.pendingPages} pending pages, ${queue.processingPages} running`
     + (queue.lastClaimSeconds === null ? ', never claimed' : `, last claim ${queue.lastClaimSeconds}s ago`),
     queue.stalled
       ? (config.runWorkerInProcess

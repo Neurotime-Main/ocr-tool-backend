@@ -30,20 +30,27 @@ enum PageStatus {
 }
 
 model Document {
-  id           String      @id @default(cuid())
-  originalName String
-  storageKey   String      @unique
-  mimeType     String      @default("application/pdf")
-  size         Int
-  pageCount    Int?
-  ocrStatus    OcrStatus   @default(PENDING)
-  ocrLanguage  String      @default("eng")
-  ocrMode      String      @default("AUTO")
-  ocrError     String?
-  createdAt    DateTime    @default(now())
-  updatedAt    DateTime    @updatedAt
-  pages        OcrPage[]
-  highlights   Highlight[]
+  id             String      @id @default(cuid())
+  originalName   String
+  storageKey     String      @unique
+  mimeType       String      @default("application/pdf")
+  size           Int
+  pageCount      Int?
+  ocrStatus      OcrStatus   @default(PENDING)
+  ocrLanguage    String      @default("eng")
+  ocrMode        String      @default("AUTO")
+  /// Isolates development and production workers that share one database.
+  queueNamespace String      @default("production")
+  /// Set only after every page has been enumerated. Recognition must not claim
+  /// partial preparation rows left by a deploy or crash.
+  preparedAt     DateTime?
+  ocrError       String?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+  pages          OcrPage[]
+  highlights     Highlight[]
+
+  @@index([queueNamespace, preparedAt, ocrStatus, createdAt])
 }
 
 model OcrPage {

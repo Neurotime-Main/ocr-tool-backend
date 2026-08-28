@@ -42,6 +42,13 @@ class Daemon {
         PPOCR_MODEL_DIR: config.ocrModelDir,
         PPOCR_THREADS: String(config.ocrThreadsPerWorker),
         PPOCR_DET_MAX_SIDE: String(config.ocrDetectionMaxSide),
+        // Native libraries otherwise size themselves from the Render host,
+        // not this container's CPU quota. Dozens of threads fighting over one
+        // allotted CPU makes dense pages slower, not faster.
+        OMP_NUM_THREADS: String(config.ocrThreadsPerWorker),
+        OPENBLAS_NUM_THREADS: String(config.ocrThreadsPerWorker),
+        MKL_NUM_THREADS: String(config.ocrThreadsPerWorker),
+        NUMEXPR_NUM_THREADS: String(config.ocrThreadsPerWorker),
       },
     });
     this.child = child;

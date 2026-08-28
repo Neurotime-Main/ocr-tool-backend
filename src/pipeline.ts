@@ -70,16 +70,25 @@ export async function prepareDocument(documentId: string, signal: AbortSignal) {
   const document = await prisma.document.findUnique({ where: { id: documentId } });
   if (!document) return;
 
+  const startedAt = Date.now();
   const workDir = await mkdtemp(path.join(config.tempDir, `prep-${documentId}-`));
   let pdf: PdfHandle | undefined;
+  let downloadMs = 0;
+  let openMs = 0;
+  let textPages = 0;
+  let ocrPages = 0;
   try {
     await prisma.document.update({
       where: { id: documentId },
-      data: { ocrStatus: 'PROCESSING', ocrError: null },
+      data: { ocrStatus: 'PROCESSING', ocrError: null, preparedAt: null },
     });
+    const downloadStartedAt = Date.now();
     const pdfPath = await storage.materialize(document.storageKey, workDir);
+    downloadMs = Date.now() - downloadStartedAt;
     if (signal.aborted) return;
+    const openStartedAt = Date.now();
     pdf = await openPdf(pdfPath);
+    openMs = Date.now() - openStartedAt;
     const forceOcr = document.ocrMode === 'FORCE_OCR';
 
     await prisma.document.update({ where: { id: documentId }, data: { pageCount: pdf.pageCount } });
@@ -109,6 +118,8 @@ export async function prepareDocument(documentId: string, signal: AbortSignal) {
       if (signal.aborted) return;
       const page = await pdf.readPage(pageNumber, { withText: !forceOcr });
       const usable = !forceOcr && embeddedTextIsUsable(page);
+      if (usable) textPages += 1;
+      else ocrPages += 1;
       chunk.push({
         documentId,
         pageNumber,
@@ -123,7 +134,19 @@ export async function prepareDocument(documentId: string, signal: AbortSignal) {
       if (chunk.length >= PAGE_DB_CHUNK) await flush();
     }
     await flush();
+    // This is the commit point for preparation. The claim query ignores every
+    // page row until this is set, so a deploy midway through chunked inserts
+    // can never make a truncated document look complete.
+    await prisma.document.update({
+      where: { id: documentId },
+      data: { preparedAt: new Date() },
+    });
     await refreshDocumentStatus(documentId);
+    console.log(
+      `[ocr] prepared document=${documentId} pages=${pdf.pageCount} text=${textPages} ocr=${ocrPages} `
+      + `download=${(downloadMs / 1000).toFixed(2)}s open=${(openMs / 1000).toFixed(2)}s `
+      + `total=${((Date.now() - startedAt) / 1000).toFixed(2)}s mode=${document.ocrMode}`,
+    );
   } catch (error) {
     if (signal.aborted) return;
     const message = error instanceof Error ? error.message : 'Unknown failure while opening the document';
@@ -131,6 +154,7 @@ export async function prepareDocument(documentId: string, signal: AbortSignal) {
       where: { id: documentId },
       data: { ocrStatus: 'FAILED', ocrError: message.slice(0, 1000) },
     }).catch(() => undefined);
+    console.error(`[ocr] preparation failed document=${documentId} after ${((Date.now() - startedAt) / 1000).toFixed(2)}s: ${message}`);
   } finally {
     await pdf?.close().catch(() => undefined);
     await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
@@ -245,16 +269,21 @@ export const documentCache = new DocumentCache();
  * which is what makes a partly-processed batch usable.
  */
 export async function processPage(page: ClaimedPage, signal: AbortSignal) {
+  const startedAt = Date.now();
   const workDir = await mkdtemp(path.join(config.tempDir, `page-${page.documentId}-`));
   let imagePath: string | undefined;
   try {
+    const acquireStartedAt = Date.now();
     const { localPath, pdf } = await documentCache.acquire(page.storageKey);
+    const acquireMs = Date.now() - acquireStartedAt;
     try {
       // Only the page box is needed: the text layer was already considered
       // when this page was queued, and it lost.
       const geometry = await pdf.readPage(page.pageNumber, { withText: false });
       const dpi = renderDpiForPage(geometry);
       await renderSlots.acquire();
+      const renderStartedAt = Date.now();
+      let renderMs = 0;
       try {
         imagePath = await renderPageImage(
           localPath,
@@ -263,6 +292,7 @@ export async function processPage(page: ClaimedPage, signal: AbortSignal) {
           dpi,
           signal,
         );
+        renderMs = Date.now() - renderStartedAt;
       } finally {
         renderSlots.release();
       }
@@ -270,11 +300,14 @@ export async function processPage(page: ClaimedPage, signal: AbortSignal) {
       // The detector downsamples internally, so asking it for more than the
       // raster actually holds would only cost time.
       const maxSide = Math.min(config.ocrDetectionMaxSide, Math.max(imageWidth, imageHeight));
+      const recognizeStartedAt = Date.now();
       const lines = await ocrPool().run(imagePath, maxSide, signal);
+      const recognizeMs = Date.now() - recognizeStartedAt;
 
       const words: OcrWord[] = lines.flatMap((line, index) => lineToWords(line, page.pageNumber, index));
       const text = lines.map((line) => line.text).join('\n');
 
+      const storeStartedAt = Date.now();
       await completePage(page.id, {
         width: geometry.width,
         height: geometry.height,
@@ -283,6 +316,13 @@ export async function processPage(page: ClaimedPage, signal: AbortSignal) {
         searchText: normalizeForSearch(text),
         words: compactWords(words) as unknown as Prisma.InputJsonValue,
       });
+      const storeMs = Date.now() - storeStartedAt;
+      console.log(
+        `[ocr] page document=${page.documentId} page=${page.pageNumber} `
+        + `acquire=${(acquireMs / 1000).toFixed(2)}s render=${(renderMs / 1000).toFixed(2)}s `
+        + `recognize=${(recognizeMs / 1000).toFixed(2)}s store=${(storeMs / 1000).toFixed(2)}s `
+        + `total=${((Date.now() - startedAt) / 1000).toFixed(2)}s dpi=${dpi} detector=${maxSide}`,
+      );
     } finally {
       documentCache.release(page.storageKey);
     }

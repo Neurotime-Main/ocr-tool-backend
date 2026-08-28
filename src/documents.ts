@@ -79,7 +79,7 @@ export async function requeueDocument(documentId: string, ocrMode: string) {
     prisma.highlight.deleteMany({ where: { documentId, source: 'AUTO' } }),
     prisma.document.update({
       where: { id: documentId },
-      data: { ocrStatus: 'PENDING', ocrError: null, ocrMode, pageCount: null },
+      data: { ocrStatus: 'PENDING', ocrError: null, ocrMode, pageCount: null, preparedAt: null },
     }),
   ]);
 }

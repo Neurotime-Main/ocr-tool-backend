@@ -16,7 +16,7 @@ import { prisma } from './db.js';
  * is simply the set of pages that are not finished yet.
  */
 
-export const WORKER_ID = `${process.env.RENDER_INSTANCE_ID ?? 'local'}-${process.pid}-${randomUUID().slice(0, 8)}`;
+export const WORKER_ID = `${config.queueNamespace}-${process.env.RENDER_INSTANCE_ID ?? 'local'}-${process.pid}-${randomUUID().slice(0, 8)}`;
 
 export type ClaimedPage = {
   id: string;
@@ -45,7 +45,10 @@ export async function claimPages(limit: number): Promise<ClaimedPage[]> {
       SELECT p.id
       FROM "OcrPage" p
       JOIN "Document" d ON d.id = p."documentId"
-      WHERE p.status = 'PENDING' AND p.attempts < ${config.maxPageAttempts}
+      WHERE p.status = 'PENDING'
+        AND p.attempts < ${config.maxPageAttempts}
+        AND d."queueNamespace" = ${config.queueNamespace}
+        AND d."preparedAt" IS NOT NULL
       ORDER BY d."createdAt" ASC, p."pageNumber" ASC
       FOR UPDATE OF p SKIP LOCKED
       LIMIT ${limit}
@@ -84,6 +87,7 @@ export async function releaseStalePages() {
   const retired = await prisma.ocrPage.updateMany({
     where: {
       status: 'PROCESSING',
+      document: { queueNamespace: config.queueNamespace },
       startedAt: { lt: cutoff },
       attempts: { gte: config.maxPageAttempts },
     },
@@ -96,13 +100,21 @@ export async function releaseStalePages() {
   });
 
   const returned = await prisma.ocrPage.updateMany({
-    where: { status: 'PROCESSING', startedAt: { lt: cutoff } },
+    where: {
+      status: 'PROCESSING',
+      document: { queueNamespace: config.queueNamespace },
+      startedAt: { lt: cutoff },
+    },
     data: { status: 'PENDING', lockedBy: null, startedAt: null },
   });
 
   // Rows already stranded by an earlier release, before the rule above existed.
   const rescued = await prisma.ocrPage.updateMany({
-    where: { status: 'PENDING', attempts: { gte: config.maxPageAttempts } },
+    where: {
+      status: 'PENDING',
+      document: { queueNamespace: config.queueNamespace },
+      attempts: { gte: config.maxPageAttempts },
+    },
     data: {
       status: 'FAILED',
       error: 'This page ran out of attempts while a worker was being restarted.',
@@ -115,7 +127,12 @@ export async function releaseStalePages() {
 }
 
 export async function pendingPageCount() {
-  return prisma.ocrPage.count({ where: { status: { in: ['PENDING', 'PROCESSING'] } } });
+  return prisma.ocrPage.count({
+    where: {
+      status: { in: ['PENDING', 'PROCESSING'] },
+      document: { queueNamespace: config.queueNamespace },
+    },
+  });
 }
 
 /**
@@ -239,7 +256,11 @@ export async function backfillPages(normalize: (value: string) => string, batchS
   // the previous pipeline wrote, because the column and the compact word shape
   // were introduced together. A genuinely blank page is excluded by `text`.
   const pending = await prisma.ocrPage.findMany({
-    where: { searchText: '', NOT: { text: '' } },
+    where: {
+      searchText: '',
+      NOT: { text: '' },
+      document: { queueNamespace: config.queueNamespace },
+    },
     select: { id: true, text: true, words: true },
     take: batchSize,
   });
@@ -257,8 +278,10 @@ export async function backfillPages(normalize: (value: string) => string, batchS
 }
 
 export type QueueHealth = {
+  unpreparedDocuments: number;
   pendingPages: number;
   processingPages: number;
+  oldestUnpreparedSeconds: number | null;
   oldestPendingSeconds: number | null;
   lastClaimSeconds: number | null;
   stalled: boolean;
@@ -276,33 +299,54 @@ export type QueueHealth = {
  * crash-looping, or pointed at the wrong database.
  */
 export async function getQueueHealth(): Promise<QueueHealth> {
-  const [pendingPages, processingPages, oldest, lastClaim] = await Promise.all([
-    prisma.ocrPage.count({ where: { status: 'PENDING' } }),
-    prisma.ocrPage.count({ where: { status: 'PROCESSING' } }),
+  const unpreparedWhere: Prisma.DocumentWhereInput = {
+    queueNamespace: config.queueNamespace,
+    ocrStatus: { in: ['PENDING', 'PROCESSING'] },
+    preparedAt: null,
+  };
+  const [unpreparedDocuments, pendingPages, processingPages, oldest, lastClaim, oldestUnprepared] = await Promise.all([
+    prisma.document.count({ where: unpreparedWhere }),
+    prisma.ocrPage.count({
+      where: { status: 'PENDING', document: { queueNamespace: config.queueNamespace } },
+    }),
+    prisma.ocrPage.count({
+      where: { status: 'PROCESSING', document: { queueNamespace: config.queueNamespace } },
+    }),
     prisma.ocrPage.findFirst({
-      where: { status: 'PENDING' },
+      where: { status: 'PENDING', document: { queueNamespace: config.queueNamespace } },
       select: { createdAt: true },
       orderBy: { createdAt: 'asc' },
     }),
     prisma.ocrPage.findFirst({
-      where: { startedAt: { not: null } },
+      where: {
+        startedAt: { not: null },
+        document: { queueNamespace: config.queueNamespace },
+      },
       select: { startedAt: true },
       orderBy: { startedAt: 'desc' },
+    }),
+    prisma.document.findFirst({
+      where: unpreparedWhere,
+      select: { createdAt: true },
+      orderBy: { createdAt: 'asc' },
     }),
   ]);
 
   const secondsSince = (date: Date | null | undefined) =>
     date ? Math.round((Date.now() - date.getTime()) / 1000) : null;
+  const oldestUnpreparedSeconds = secondsSince(oldestUnprepared?.createdAt);
   const oldestPendingSeconds = secondsSince(oldest?.createdAt);
   const lastClaimSeconds = secondsSince(lastClaim?.startedAt);
 
   return {
+    unpreparedDocuments,
     pendingPages,
     processingPages,
+    oldestUnpreparedSeconds,
     oldestPendingSeconds,
     lastClaimSeconds,
-    stalled: pendingPages > 0
-      && (oldestPendingSeconds ?? 0) > 120
+    stalled: (pendingPages > 0 || unpreparedDocuments > 0)
+      && Math.max(oldestPendingSeconds ?? 0, oldestUnpreparedSeconds ?? 0) > 120
       && (lastClaimSeconds === null || lastClaimSeconds > 120),
   };
 }
