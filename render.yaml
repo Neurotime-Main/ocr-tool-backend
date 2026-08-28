@@ -1,24 +1,30 @@
+# Two services from one image.
+#
+# The API and the recognition worker used to be the same process, so a batch of
+# scans starved the HTTP server of CPU while it ran and a deploy dropped
+# whatever was in flight. They are split here: the queue lives in Postgres, so
+# the worker can be scaled -- or restarted -- entirely independently of the API.
+
 services:
   - type: web
     name: markwise-api
     runtime: docker
     dockerfilePath: ./Dockerfile
     healthCheckPath: /api/health
-    # Your Neon project lives in eu-central-1, so keep the API and the S3
-    # bucket in Frankfurt too. A cross-region hop is paid on every query and
-    # on every page image pulled back for OCR.
+    # Your Neon project lives in eu-central-1, so keep the API and the Space in
+    # Frankfurt too. A cross-region hop is paid on every query.
     region: frankfurt
-    # OCR keeps working through a deploy until the queue drains.
-    maxShutdownDelaySeconds: 120
-    # OCR is CPU and memory hungry: each page runs a native Tesseract process
-    # holding the raster and its language model. Starter (512 MB) runs one page
-    # at a time and is tight; Standard (2 GB / 1 CPU) is the realistic floor for
-    # batches. CPU is what decides per-page latency, so more cores is the upgrade
-    # that makes a large document finish sooner.
-    plan: standard
+    # The API only serves HTTP now: uploads, status polling, search and export.
+    # It no longer needs headroom for recognition, so this plan is about
+    # request concurrency rather than OCR throughput.
+    plan: starter
     envVars:
       - key: NODE_ENV
         value: production
+      # Recognition belongs to the worker service below. Without this the API
+      # would claim pages too and take CPU away from serving requests.
+      - key: RUN_OCR_IN_API
+        value: false
 
       # --- Neon -------------------------------------------------------------
       # DATABASE_URL: the POOLED connection string (host contains "-pooler").
@@ -37,30 +43,22 @@ services:
         sync: false
 
       # --- Object storage (DigitalOcean Spaces, ams3) ------------------------
-      # Render's disk is ephemeral, so uploaded PDFs must live in object
-      # storage. The AWS SDK is the client because Spaces speaks the S3
-      # protocol, but nothing here is AWS and no AWS account is involved.
       - key: STORAGE_DRIVER
         value: spaces
-      # The Space name on its own, with no region and no URL.
       - key: DO_SPACES_BUCKET
         sync: false
       # What selects Spaces. Without it the SDK resolves an amazonaws.com host
       # and 'ams3' signs against nothing, so every call fails.
       - key: DO_SPACES_ENDPOINT
         value: https://ams3.digitaloceanspaces.com
-      # Amsterdam. Used only for signing, but it must match the endpoint host.
       - key: DO_SPACES_REGION
         value: ams3
       - key: DO_SPACES_FORCE_PATH_STYLE
         value: true
       # The SDK frames PutObject as 'aws-chunked' to append a trailing
-      # checksum, which Spaces rejects. Both flags default to the Spaces-safe
-      # setting in config.ts; they are spelled out here so the behaviour is
-      # visible on the service rather than implied.
+      # checksum, which Spaces rejects.
       - key: DO_SPACES_DISABLE_CHECKSUMS
         value: true
-      # Spaces access key and secret, not AWS IAM credentials.
       - key: DO_SPACES_KEY
         sync: false
       - key: DO_SPACES_SECRET
@@ -76,13 +74,75 @@ services:
       - key: UPLOAD_STORAGE_CONCURRENCY
         value: 4
 
+  - type: worker
+    name: markwise-ocr-worker
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerCommand: node dist/worker.js
+    region: frankfurt
+    # Pages are claimed from Postgres, so shutting down cleanly means handing
+    # back whatever this instance was holding. The pages are then picked up by
+    # another instance -- or by this one after the deploy -- with their retry
+    # count untouched.
+    maxShutdownDelaySeconds: 120
+    # This is the plan that decides how fast a batch finishes.
+    #
+    # Recognition is CPU bound and each page gets one core, so pages-in-parallel
+    # is simply the core count: standard (2 GB / 1 CPU) reads one page at a
+    # time, pro (4 GB / 2 CPU) two, pro plus (8 GB / 4 CPU) four. Memory matters
+    # too -- each recognition daemon holds about 360 MB -- but on every plan
+    # above it is the cores that run out first.
+    #
+    # Raising `numInstances` scales the same way and is the cheaper move for a
+    # bursty batch, because several small workers share one queue without any
+    # coordination.
+    plan: pro
+    numInstances: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+
+      - key: DATABASE_URL
+        sync: false
+      - key: DIRECT_URL
+        sync: false
+
+      - key: STORAGE_DRIVER
+        value: spaces
+      - key: DO_SPACES_BUCKET
+        sync: false
+      - key: DO_SPACES_ENDPOINT
+        value: https://ams3.digitaloceanspaces.com
+      - key: DO_SPACES_REGION
+        value: ams3
+      - key: DO_SPACES_FORCE_PATH_STYLE
+        value: true
+      - key: DO_SPACES_DISABLE_CHECKSUMS
+        value: true
+      - key: DO_SPACES_KEY
+        sync: false
+      - key: DO_SPACES_SECRET
+        sync: false
+      - key: DO_SPACES_PREFIX
+        value: documents
+
       # --- OCR throughput ---------------------------------------------------
-      # Leave OCR_CONCURRENCY unset: the service sizes the recognition pool
-      # from the instance's CPU count and free memory. Set it only to pin the
-      # pool on a small plan, or to raise it after moving to a larger one.
+      # Leave OCR_CONCURRENCY unset: the worker sizes its pool from the CPU it
+      # is actually scheduled for and the memory it has free. Set it only to pin
+      # the pool, for instance while diagnosing memory pressure.
       # - key: OCR_CONCURRENCY
       #   value: 2
+      #
+      # Rasterisation DPI. 200 is comfortably enough for PP-OCRv5, which
+      # downsamples the image again before detection; raise it only for
+      # genuinely poor scans.
       - key: OCR_RENDER_DPI
-        value: 260
+        value: 200
       - key: OCR_MAX_PAGE_PIXELS
         value: 12000000
+      # Longest side the text detector sees. This is the accuracy control that
+      # matters for dense pages: 1600 finds broadsheet body copy, and lowering
+      # it to 1280 is roughly a third faster on such pages at the cost of the
+      # smallest text.
+      - key: PPOCR_DET_MAX_SIDE
+        value: 1600

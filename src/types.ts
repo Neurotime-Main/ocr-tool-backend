@@ -6,6 +6,7 @@ export type OcrWord = {
   y: number;
   width: number;
   height: number;
+  /** No longer written. Present only on pages stored before it was dropped. */
   blockId?: string;
   lineId?: string;
 };

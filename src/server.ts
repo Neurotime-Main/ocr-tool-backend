@@ -6,17 +6,20 @@ import { mkdir, mkdtemp, rm, unlink } from 'node:fs/promises';
 import { config } from './config.js';
 import { prisma } from './db.js';
 import { storage } from './storage.js';
-import {
-  cancelDocumentProcessing, checkOcrEngine, enqueueDocumentProcessing, ensureOcrDirectories,
-  getOcrProgress, resumeQueuedOcrJobs, shutdownOcrWorkers,
-} from './ocr.js';
+import { checkOcrEngine } from './ocrEngine.js';
+import { checkRenderer } from './render.js';
+import { ensureWorkerDirectories, startOcrWorker, stopOcrWorker } from './ocrWorker.js';
+import { getOcrProgress, requeueDocument } from './documents.js';
 import { addHighlightsToPdf } from './exportPdf.js';
 import { createFindingsWorkbook } from './excelReport.js';
 import { documentIdsSchema, documentSearchSchema, highlightListSchema } from './validation.js';
 import { buildStoredFindings, searchDocuments } from './search.js';
 
-await ensureOcrDirectories();
-await resumeQueuedOcrJobs();
+await ensureWorkerDirectories();
+// In production the recognition worker is its own Render service, so that OCR
+// never takes CPU away from HTTP. Everywhere else it runs here, which keeps
+// local development to a single command.
+if (config.runWorkerInProcess) startOcrWorker();
 
 const app = express();
 app.set('trust proxy', 1);
@@ -88,7 +91,10 @@ async function discardDocuments(ids: string[]) {
     select: { id: true, storageKey: true },
   });
   if (!documents.length) return [];
-  await Promise.all(documents.map((document) => cancelDocumentProcessing(document.id)));
+  // Deleting the document removes its page rows too, so anything still queued
+  // simply stops existing. A page already in flight finishes into rows that the
+  // cascade has removed, which Prisma reports and the worker logs as a failed
+  // page for a document nobody is waiting for.
   await prisma.document.deleteMany({ where: { id: { in: documents.map((document) => document.id) } } });
   await Promise.all(documents.map((document) => storage.delete(document.storageKey).catch(() => undefined)));
   return documents.map((document) => document.id);
@@ -99,12 +105,13 @@ app.get('/api/health', async (_request, response) => {
   // the service cannot work without. A broken bucket policy, a wrong region, or
   // an image missing the OCR binary then fails the deploy instead of surfacing
   // on a user's first upload.
-  const [database, storageStatus, ocrEngine] = await Promise.all([
+  const [database, storageStatus, ocrEngine, renderer] = await Promise.all([
     prisma.$queryRaw`SELECT 1`.then(() => 'connected' as const).catch(() => 'unavailable' as const),
     storage.check(),
     checkOcrEngine(),
+    checkRenderer(),
   ]);
-  const ok = database === 'connected' && storageStatus.ok && ocrEngine.ok;
+  const ok = database === 'connected' && storageStatus.ok && ocrEngine.ok && renderer.ok;
   response.status(ok ? 200 : 503).json({
     ok,
     database,
@@ -116,6 +123,10 @@ app.get('/api/health', async (_request, response) => {
     ocr: {
       ok: ocrEngine.ok,
       ...(ocrEngine.ok ? { engine: ocrEngine.detail } : { error: ocrEngine.detail }),
+    },
+    renderer: {
+      ok: renderer.ok,
+      ...(renderer.ok ? { engine: renderer.detail } : { error: renderer.detail }),
     },
   });
 });
@@ -145,7 +156,6 @@ app.post('/api/documents', upload.single('file'), async (request, response, next
       },
     });
     response.status(201).json(document);
-    enqueueDocumentProcessing(document.id);
   } catch (error) {
     if (request.file) await unlink(request.file.path).catch(() => undefined);
     if (storageKey) await storage.delete(storageKey);
@@ -211,7 +221,6 @@ app.post('/api/documents/batch', upload.array('files', config.maxBatchFiles), as
     }
 
     response.status(201).json({ documents });
-    documents.forEach((document) => enqueueDocumentProcessing(document.id));
   } catch (error) {
     next(error);
   } finally {
@@ -247,7 +256,8 @@ app.post('/api/documents/statuses', async (request, response, next) => {
       },
       orderBy: { createdAt: 'asc' },
     });
-    response.json({ documents: documents.map((document) => ({ ...document, ocrProgress: getOcrProgress(document.id) })) });
+    const progress = await getOcrProgress(ids);
+    response.json({ documents: documents.map((document) => ({ ...document, ocrProgress: progress.get(document.id) ?? null })) });
   } catch (error) {
     next(error);
   }
@@ -296,12 +306,8 @@ app.post('/api/documents/:id/ocr', async (request, response, next) => {
     if (document.ocrStatus === 'PROCESSING') return response.status(409).json({ error: 'OCR is already running.' });
     const requestedMode = request.body?.ocrMode == null ? document.ocrMode : String(request.body.ocrMode).toUpperCase();
     if (!['AUTO', 'FORCE_OCR'].includes(requestedMode)) return response.status(400).json({ error: `Unsupported OCR mode: ${requestedMode}` });
-    await prisma.document.update({
-      where: { id: document.id },
-      data: { ocrStatus: 'PENDING', ocrError: null, ocrMode: requestedMode },
-    });
+    await requeueDocument(document.id, requestedMode);
     response.status(202).json({ status: 'PENDING' });
-    enqueueDocumentProcessing(document.id);
   } catch (error) {
     next(error);
   }
@@ -390,7 +396,7 @@ const server = app.listen(config.port, () => {
 
 async function shutdown() {
   server.close();
-  await shutdownOcrWorkers();
+  await stopOcrWorker();
   await prisma.$disconnect();
 }
 

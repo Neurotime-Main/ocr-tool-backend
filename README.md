@@ -4,54 +4,115 @@ Standalone Node.js/Express backend for batch OCR processing, highlight persisten
 
 ## Production architecture
 
-- **Render:** Docker web service. The image includes Poppler for PDF text extraction and page rasterization.
-- **Neon:** PostgreSQL database accessed through Prisma.
-- **DigitalOcean Spaces (`ams3`):** Private storage for uploaded source PDFs, reached through the S3 SDK. Render's filesystem is used only for temporary page images and exported files.
-- **Tesseract:** Runs inside the Render service with bundled English and Azerbaijani language data; no OCR API is called.
+- **Render:** two services built from one Docker image.
+  - `markwise-api` (web) serves uploads, status, search and export. It runs no OCR.
+  - `markwise-ocr-worker` (worker) reads pages off the queue. Scale this one to make batches finish sooner.
+- **Neon:** PostgreSQL through Prisma. It also holds the work queue.
+- **DigitalOcean Spaces (`ams3`):** private storage for uploaded source PDFs, reached through the S3 SDK. Render's filesystem holds only temporary page images.
+- **PaddleOCR PP-OCRv5** on ONNX Runtime, in a Python daemon beside the worker. The models ship inside the image, so no page ever leaves the container.
 
-OCR supports `eng`, `aze`, and mixed `aze+eng`. Automatic mode uses usable embedded PDF text when available and OCRs image-based or low-quality pages. Force OCR mode rasterizes every page and falls back to sparse-text layout analysis for decorated forms, posters, columns, and scattered text. The Render Docker image includes Tesseract's official English and Azerbaijani models; OCR remains entirely local to the server.
+The batch API accepts up to 30 PDFs per request. Source files are persisted to Spaces with four bounded parallel uploads by default (`UPLOAD_STORAGE_CONCURRENCY`). `MAX_BATCH_FILES` controls the upload count and each file is limited independently by `MAX_UPLOAD_MB`.
 
-The batch API accepts up to 30 PDFs per request. Source files are persisted to S3 with four bounded parallel uploads by default (`UPLOAD_STORAGE_CONCURRENCY`), so a batch does not wait for every S3 round trip in sequence. `MAX_BATCH_FILES` controls the upload count and each file is still limited independently by `MAX_UPLOAD_MB`.
+## How a document is processed
+
+Pages, not documents, are the unit of work, and the queue is a table in Postgres rather than an array in the API process. That gives four things the previous design could not:
+
+1. **Results appear as they are read.** Every finished page is written immediately, so a batch is searchable while the rest of it is still running. Nothing waits for the slowest PDF.
+2. **A bad page costs a page.** Each page gets three attempts; one that keeps failing is marked `FAILED` and the rest of its document completes without it. `ocrError` then says how many pages were lost and which one failed first.
+3. **A deploy loses nothing.** Workers claim pages with `FOR UPDATE SKIP LOCKED` and hand them back on shutdown. A page whose worker vanished is returned to the queue when its lock expires (`OCR_STALE_LOCK_MS`).
+4. **Workers scale sideways.** Any number of instances can share the queue with no coordination.
+
+The pipeline for each page:
+
+```
+upload -> Spaces -> prepare (open PDF, read text layer per page)
+                       |
+       .---------------+----------------.
+       |                                |
+  text layer usable              needs recognition
+   write page, done              queue page -> claim -> render JPEG
+                                    -> PaddleOCR PP-OCRv5 -> write page
+```
+
+### The text layer comes first
+
+Most pages never reach the recogniser. `prepare` reads each page's embedded text and uses it when it is complete and well-formed — about **0.05 s a page**, against several seconds to rasterise and recognise one. Across the sample corpus in `storage/`, 93% of pages are served this way.
+
+Two things make that number as high as it is:
+
+- **Legacy Azerbaijani font encodings are decoded, not rejected.** Several of these publications draw perfectly good text with non-Unicode fonts, so their text layer arrives looking like `Àçÿðáàéúàíûí` (byte-mapped) or `ийул` (Cyrillic-mapped). Both are decoded to `Azərbaycanın` and `iyul`. Previously they were treated as mojibake and every such page was rasterised and recognised instead — which is why the documents with the *best* text layers were the slowest in the batch.
+- **A few undecodable glyphs no longer condemn a page.** Wingdings list bullets land in the Unicode private-use area; two of them in ten thousand characters used to send the whole page to OCR. They are now stripped, and only a page that is *substantially* undecodable (over 2%) is recognised.
+
+Force-OCR mode skips this branch entirely and rasterises every page.
 
 ## OCR throughput
 
-Pages, not documents, are the unit of parallel work. Every queued document draws from one shared pool of recognition slots, so a single 40-page scan uses the whole machine just as a 30-file batch does. Each slot runs the native `tesseract` binary as a short-lived process per page. The knobs:
+Recognition is CPU bound and each page uses one core, so **pages in parallel is simply the worker's core count**. The knobs:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `OCR_CONCURRENCY` | smaller of CPU cores − 1 and free memory ÷ 192 MB, capped at 8 | Pages recognized at the same time across all documents. "CPU cores" is the container's cgroup CPU quota where one is set, not the host's core count, so a fractional-CPU plan does not oversubscribe itself. |
-| `OCR_DOCUMENT_CONCURRENCY` | `OCR_CONCURRENCY` (min 2) | Documents allowed to have pages in flight. |
-| `OCR_RENDER_CONCURRENCY` | half of `OCR_CONCURRENCY` (min 2) | Parallel Poppler rasterizations. Rendering overlaps recognition instead of blocking it. |
-| `OCR_RENDER_DPI` | `260` | Target rasterization DPI. Use `300` for difficult small print. |
-| `OCR_MAX_PAGE_PIXELS` | `12000000` | Ceiling on a single rendered page. Oversized page boxes are rendered below `OCR_RENDER_DPI` rather than producing 20+ megapixel images that cost seconds per page without adding readable detail. A4 at 260 DPI is 6.5 MP and is never downscaled. |
-| `OCR_MIN_RENDER_DPI` | `150` | Floor for that downscaling. |
+| `OCR_CONCURRENCY` | smaller of the container's CPU quota and free memory ÷ 420 MB, capped at 8 | Pages recognised at once. "CPU" is the cgroup quota where one is set, not the host's core count. |
+| `OCR_RENDER_CONCURRENCY` | half of `OCR_CONCURRENCY` | Parallel Poppler rasterisations, overlapped with recognition. |
+| `OCR_RENDER_DPI` | `200` | Rasterisation DPI. PP-OCRv5 downsamples again before detection, so higher values mostly cost time. |
+| `PPOCR_DET_MAX_SIDE` | `1600` | Longest side the text detector sees. This is the accuracy control for dense pages: 1600 finds broadsheet body copy; 1280 is roughly a third faster and loses the smallest text. |
+| `PPOCR_THREADS` | `1` | Threads inside one recognition daemon. Four single-threaded daemons beat one four-threaded daemon by a wide margin, so leave this alone unless the worker has one core. |
+| `OCR_MAX_PAGE_PIXELS` | `12000000` | Ceiling on one rendered page; oversized page boxes render below `OCR_RENDER_DPI`. |
+| `OCR_MAX_PAGE_ATTEMPTS` | `3` | Attempts before a page is given up on. |
+| `OCR_STALE_LOCK_MS` | `600000` | How long a claimed page may be silent before another worker may take it. |
+| `RUN_OCR_IN_API` | `false` in production | Runs the worker inside the API process. On by default in development so `npm run dev` is one command. |
 
-Other things that shape the runtime:
+### Why PaddleOCR, and why not Tesseract
 
-- The sparse-text second pass only runs when the automatic layout returns few words or low confidence, instead of on every force-OCR page.
-- `aze+eng` runs two language models over every line and is roughly 1.7x slower per page than `aze` alone. Pick the single language when the set is not genuinely bilingual.
-- The Docker image downloads `tessdata_fast`, which reads a page about twice as fast as `tessdata_best` with near-identical output on typical scans. Build with `--build-arg TESSDATA_VARIANT=tessdata_best` for very poor-quality originals.
-- Recognized pages are written with `createMany`, so a long PDF costs a couple of statements rather than one round trip per page.
+Measured on a broadsheet page from `storage/`, single-threaded, same machine:
 
-Use the workspace's **Re-run OCR** action to reprocess an existing file with the more thorough complex-layout mode.
+| | Tesseract 5.5 | PaddleOCR PP-OCRv5 |
+| --- | --- | --- |
+| Time | 11.1 s (plus a second 11 s pass on weak pages) | ~7 s |
+| Words found | 1931 | 1742 |
+| Mean confidence | 0.75 | 0.98 |
+| Azerbaijani output | heavily garbled | clean |
+
+Tesseract also needed a second full pass whenever the first returned few words or low confidence, which on scanned pages was often — so its real cost was frequently double the figure above. PP-OCRv5 detects and recognises in one pass.
+
+The recogniser runs as a **persistent daemon** rather than a process per page: loading the three models costs about a fifth of a second, which would otherwise be paid on every page. A daemon that crashes, times out, or breaks protocol is killed and replaced, and its page is retried on a fresh process.
+
+**One upstream gap is worth knowing about.** PaddleOCR's Latin PP-OCRv5 model has no lowercase `ə` in its character set, though it has `Ə`, so it writes `Azrbaycan` where the page reads `Azərbaycan`. Keyword search compensates by removing `ə` from both the query and the stored text, so `Azərbaycan` matches either spelling. Exported text keeps whatever was recognised.
+
+## Search
+
+Keyword search filters candidate pages in the database before loading anything. Each page stores `searchText`: its text put through the same normaliser the matcher uses, with spaces removed, indexed with a `pg_trgm` GIN index. A page that cannot contain a keyword is ruled out in Postgres rather than having its word boxes shipped to the API to find that out.
+
+Matching then runs on a line's letters with the spaces taken out. These documents are typeset in justified columns that break words across syllables — `şəbəkələrdən` is set as `şə bə kə lər dən` — and PDF text layers routinely split one word into several glyph runs. A word-by-word comparison misses those; requiring the match to begin at a word start and end at a word end keeps it from over-matching. Highlight rectangles are the union of the boxes the match actually covers, so the output shape is unchanged.
+
+Pages written before `searchText` existed carry an empty value and are always treated as candidates. The worker backfills them in batches whenever the queue is idle, after which the index does its job for them too.
 
 ## Cancelling a batch
 
-`POST /api/documents/cancel` with `{ "ids": [...] }` stops queued and in-flight OCR for those documents and rolls them back completely: the in-flight page is abandoned, the queue entry is dropped, the database rows are deleted, and the stored PDFs are removed. The call waits for each running job to settle before deleting, so a job can never write pages back after the rollback. It is also what the browser's **Stop and discard** button calls, and the batch upload endpoint uses the same path to clean up after a client that aborts the request mid-upload.
+`POST /api/documents/cancel` with `{ "ids": [...] }` deletes those documents completely: their page rows (and so their queue entries), their highlights, and their stored PDFs. Deleting the queue entry is what stops the work — a page already in flight finishes into rows that no longer exist, which is harmless. It is what the browser's **Stop and discard** button calls, and the batch upload endpoint uses the same path to clean up after a client that aborts mid-upload.
 
 Excel reports include the PDF filename, page number, inferred article/page title, keyword, matched text, surrounding context, match type, OCR confidence, and user note. Heading inference uses word geometry and returns an empty title when no reliable heading is available. Export values are cleaned for UTF-8/XLSX compatibility, preserve Azerbaijani characters, repair common encoding corruption, and are protected from accidental Excel formulas.
 
 ## Local development
 
-Install Poppler first (`poppler-utils` on Debian/Ubuntu), then:
+Install Poppler and Python first (`poppler-utils` and `python3` on Debian/Ubuntu), then:
 
 ```bash
 cp .env.example .env
 docker compose up -d postgres
 npm install
 npm run prisma:migrate
+
+# The recognition daemon's runtime, and the PaddleOCR models it loads.
+python3 -m venv .venv
+.venv/bin/pip install -r python/requirements.txt
+.venv/bin/python python/download_models.py ./models
+export PYTHON_BIN="$PWD/.venv/bin/python"
+
 npm run dev
 ```
+
+`npm run dev` runs the worker inside the API process. To mirror production, set
+`RUN_OCR_IN_API=false` and start the worker separately with `npm run dev:worker`.
 
 For the Docker PostgreSQL service, replace both database variables in `.env` with:
 

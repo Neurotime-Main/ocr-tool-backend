@@ -6,3 +6,9 @@ storage/*
 !storage/.gitkeep
 tmp/*
 !tmp/.gitkeep
+
+# PaddleOCR PP-OCRv5 weights. Downloaded by python/download_models.py during
+# the image build, so a model upgrade is a rebuild rather than a commit.
+models/
+.venv/
+__pycache__/

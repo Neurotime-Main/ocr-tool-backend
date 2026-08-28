@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { prisma } from './db.js';
+import { normalizeForSearch, normalizeToken } from './normalize.js';
 import { cleanReportText } from './reportText.js';
 import type { HighlightInput, OcrWord } from './types.js';
 
@@ -17,14 +18,6 @@ export type ReportFinding = {
   note: string;
   confidence: number | null;
 };
-
-const normalize = (value: string) => value
-  .toLocaleLowerCase()
-  .normalize('NFKD')
-  .replace(/\p{M}/gu, '')
-  .replace(/ı/g, 'i')
-  .replace(/ə/g, 'e')
-  .replace(/(^[^\p{L}\p{N}\p{Pd}]+|[^\p{L}\p{N}\p{Pd}]+$)/gu, '');
 
 function groupWordsIntoLines(words: OcrWord[]) {
   const identified = new Map<string, OcrWord[]>();
@@ -52,19 +45,6 @@ function groupWordsIntoLines(words: OcrWord[]) {
   });
 }
 
-const isDash = (value: string) => /\p{Pd}/u.test(value);
-
-function isHyphenatedFragment(lines: OcrWord[][], lineIndex: number, wordIndex: number) {
-  const line = lines[lineIndex]!;
-  const word = line[wordIndex]!;
-  if (isDash(word.text.slice(0, 1)) || isDash(word.text.slice(-1))) return true;
-  const previous = lineIndex > 0 ? lines[lineIndex - 1]!.at(-1) : undefined;
-  const next = lineIndex < lines.length - 1 ? lines[lineIndex + 1]![0] : undefined;
-  if (wordIndex === 0 && previous && isDash(previous.text.slice(-1))) return true;
-  if (wordIndex === line.length - 1 && next && isDash(next.text.slice(0, 1))) return true;
-  return false;
-}
-
 function box(words: OcrWord[]) {
   const x = Math.min(...words.map((word) => word.x));
   const y = Math.min(...words.map((word) => word.y));
@@ -73,19 +53,72 @@ function box(words: OcrWord[]) {
   return { x, y, width: right - x, height: bottom - y };
 }
 
+/**
+ * A line reduced to comparable letters, with a map back to the words.
+ *
+ * Every character kept records which word it came from, so a match found in
+ * the flattened string can be turned back into the set of word boxes to
+ * highlight. Word starts and ends are recorded too, because a match is only
+ * accepted where it begins at the start of a word and finishes at the end of
+ * one.
+ */
+type FlatLine = {
+  text: string;
+  owner: number[];
+  startsWord: boolean[];
+  endsWord: boolean[];
+  words: OcrWord[];
+};
+
+function flattenLine(line: OcrWord[]): FlatLine {
+  let text = '';
+  const owner: number[] = [];
+  const startsWord: boolean[] = [];
+  const endsWord: boolean[] = [];
+  line.forEach((word, wordIndex) => {
+    const normalized = normalizeForSearch(word.text);
+    for (let index = 0; index < normalized.length; index += 1) {
+      text += normalized[index];
+      owner.push(wordIndex);
+      startsWord.push(index === 0);
+      endsWord.push(index === normalized.length - 1);
+    }
+  });
+  return { text, owner, startsWord, endsWord, words: line };
+}
+
+/**
+ * Finds every occurrence of each keyword on a page and returns a highlight for
+ * each.
+ *
+ * Matching is done on the line's letters with the spaces taken out, rather than
+ * word by word. These documents are typeset in justified newspaper columns that
+ * break words across syllables -- `şəbəkələrdən` is set as `şə bə kə lər dən`
+ * -- and PDF text layers routinely split one word into several glyph runs, so a
+ * word-by-word comparison silently misses matches that are plainly visible on
+ * the page. Requiring the match to begin at a word start and end at a word end
+ * keeps that from over-matching into the middle of longer words.
+ */
 export function findPageMatches(page: PageData, keywords: string[], documentId: string) {
   const words = page.words as OcrWord[];
-  const lines = groupWordsIntoLines(words);
+  if (!words?.length) return [];
+  const lines = groupWordsIntoLines(words).map(flattenLine);
   const matches: StoredHighlight[] = [];
+
   for (const keyword of keywords) {
-    const query = keyword.split(/\s+/).map(normalize).filter(Boolean);
-    if (!query.length) continue;
-    for (const [lineIndex, line] of lines.entries()) {
-      const normalizedWords = line.map((word) => normalize(word.text));
-      for (let index = 0; index <= normalizedWords.length - query.length; index += 1) {
-        if (!query.every((token, offset) => normalizedWords[index + offset] === token)) continue;
-        const occurrence = line.slice(index, index + query.length);
-        if (occurrence.some((_word, offset) => isHyphenatedFragment(lines, lineIndex, index + offset))) continue;
+    const needle = normalizeForSearch(keyword);
+    if (!needle) continue;
+    for (const line of lines) {
+      let from = 0;
+      for (;;) {
+        const at = line.text.indexOf(needle, from);
+        if (at === -1) break;
+        from = at + 1;
+        const end = at + needle.length - 1;
+        if (!line.startsWord[at] || !line.endsWord[end]) continue;
+        const covered = new Set(line.owner.slice(at, end + 1));
+        const occurrence = [...covered].sort((a, b) => a - b).map((index) => line.words[index]!);
+        if (!occurrence.length) continue;
         matches.push({
           id: randomUUID(),
           documentId,
@@ -97,22 +130,69 @@ export function findPageMatches(page: PageData, keywords: string[], documentId: 
           keyword,
           note: null,
         });
-        index += query.length - 1;
+        from = end + 1;
       }
     }
   }
   return matches;
 }
 
+/**
+ * Runs a keyword search across a batch of documents.
+ *
+ * The candidate pages are chosen in the database first. `searchText` holds each
+ * page's letters in the same normalised, space-free form the matcher compares
+ * against, so a page that cannot contain a keyword is ruled out on a trigram
+ * index instead of having its word boxes shipped to this process to find out.
+ * On a thirty-document batch that is the difference between loading every page
+ * in the workspace and loading the handful that actually matched.
+ *
+ * Pages still being recognised are simply not in the result yet, which is what
+ * lets a batch be searched while the rest of it is still being read.
+ */
 export async function searchDocuments(documentIds: string[], keywords: string[]) {
+  const needles = [...new Set(keywords.map(normalizeForSearch).filter(Boolean))];
+  if (!needles.length) {
+    return documentIds.map((documentId) => ({ documentId, highlights: [] }));
+  }
+
+  const candidates = await prisma.ocrPage.findMany({
+    where: {
+      documentId: { in: documentIds },
+      status: 'COMPLETE',
+      OR: [
+        ...needles.map((needle) => ({ searchText: { contains: needle } })),
+        // Pages stored before `searchText` existed carry the empty string, so
+        // they cannot be ruled out here and are matched in full below. The
+        // worker backfills them, after which this branch selects nothing.
+        { searchText: '' },
+      ],
+    },
+    select: { documentId: true, pageNumber: true, words: true },
+    orderBy: [{ documentId: 'asc' }, { pageNumber: 'asc' }],
+  });
+
+  const byDocument = new Map<string, typeof candidates>();
+  for (const page of candidates) {
+    const list = byDocument.get(page.documentId) ?? [];
+    list.push(page);
+    byDocument.set(page.documentId, list);
+  }
+
+  // Documents are written one at a time rather than in parallel: each is a
+  // delete-then-insert of its automatic highlights, and a pooled Neon
+  // connection is happier with a queue of small transactions than with thirty
+  // at once.
   const results: Array<{ documentId: string; highlights: unknown[] }> = [];
   for (const documentId of documentIds) {
     const document = await prisma.document.findUnique({
       where: { id: documentId },
-      select: { id: true, ocrStatus: true, pages: { select: { pageNumber: true, words: true }, orderBy: { pageNumber: 'asc' } } },
+      select: { id: true, ocrStatus: true },
     });
-    if (!document || document.ocrStatus !== 'COMPLETE') continue;
-    const automatic = document.pages.flatMap((page) => findPageMatches(page, keywords, document.id));
+    if (!document || document.ocrStatus === 'PENDING') continue;
+
+    const automatic = (byDocument.get(documentId) ?? [])
+      .flatMap((page) => findPageMatches(page, keywords, documentId));
     const highlights = await prisma.$transaction(async (tx) => {
       await tx.highlight.deleteMany({ where: { documentId, source: 'AUTO' } });
       if (automatic.length) await tx.highlight.createMany({ data: automatic });
@@ -136,6 +216,7 @@ function lineText(line: OcrWord[]) {
   }, '');
   return cleanReportText(text, 4000);
 }
+
 const overlap = (word: OcrWord, highlight: StoredHighlight) => {
   const width = Math.max(0, Math.min(word.x + word.width, highlight.x + highlight.width) - Math.max(word.x, highlight.x));
   const height = Math.max(0, Math.min(word.y + word.height, highlight.y + highlight.height) - Math.max(word.y, highlight.y));
@@ -182,6 +263,14 @@ function findingDetails(words: OcrWord[], highlight: StoredHighlight, pageText: 
   };
 }
 
+/**
+ * Builds the Excel report rows.
+ *
+ * Only the pages that actually carry a highlight are read. The report is
+ * usually a few dozen findings out of a workspace of thousands of pages, so
+ * fetching every page's word boxes to answer it -- which is what this used to
+ * do -- was almost entirely wasted transfer.
+ */
 export async function buildStoredFindings(documentIds: string[]): Promise<ReportFinding[]> {
   const findings: ReportFinding[] = [];
   for (const documentId of documentIds) {
@@ -189,12 +278,18 @@ export async function buildStoredFindings(documentIds: string[]): Promise<Report
       where: { id: documentId },
       select: {
         originalName: true,
-        pages: { select: { pageNumber: true, words: true, text: true } },
         highlights: { where: { source: 'AUTO' }, orderBy: [{ pageNumber: 'asc' }, { createdAt: 'asc' }] },
       },
     });
-    if (!document) continue;
-    const pages = new Map(document.pages.map((page) => [page.pageNumber, { words: page.words as OcrWord[], text: page.text }]));
+    if (!document?.highlights.length) continue;
+
+    const pageNumbers = [...new Set(document.highlights.map((highlight) => highlight.pageNumber))];
+    const pageRows = await prisma.ocrPage.findMany({
+      where: { documentId, pageNumber: { in: pageNumbers } },
+      select: { pageNumber: true, words: true, text: true },
+    });
+    const pages = new Map(pageRows.map((page) => [page.pageNumber, { words: page.words as OcrWord[], text: page.text }]));
+
     for (const highlight of document.highlights) {
       const page = pages.get(highlight.pageNumber);
       const details = findingDetails(page?.words ?? [], highlight as StoredHighlight, page?.text ?? '');
@@ -213,3 +308,5 @@ export async function buildStoredFindings(documentIds: string[]): Promise<Report
   }
   return findings;
 }
+
+export { normalizeToken };

@@ -78,9 +78,8 @@ function cgroupCpuLimit() {
   return Number.POSITIVE_INFINITY;
 }
 
-// Tesseract recognition is CPU bound, so the useful amount of parallel work is
-// set by the number of cores rather than by a fixed number. One core is left
-// for the HTTP server, PDF rendering, and the database client.
+// Recognition is CPU bound, so the useful amount of parallel work is set by
+// the number of cores the container is actually scheduled for.
 const cpuCount = (() => {
   const reported = (() => {
     try { return availableParallelism(); } catch { return 2; }
@@ -90,26 +89,28 @@ const cpuCount = (() => {
   return Number.isFinite(limit) ? Math.max(1, Math.min(reported, Math.floor(limit))) : reported;
 })();
 
-// Each concurrent page holds a `tesseract` process with the page raster and its
-// language model, so the pool is also capped by memory. Without this a small
-// container would happily start eight of them and be killed by the OOM reaper.
-// `availableMemory` is used where the runtime has it, because a developer
-// machine can have plenty of RAM installed and almost none of it free.
-//
-// A native process needs a fraction of what the previous in-process WASM worker
-// did, which is why this budget no longer pins a 2 GB instance to a single page
-// at a time.
-const WORKER_MEMORY_BUDGET = 192 * 1024 * 1024;
+// Each recognition daemon holds the PP-OCRv5 models plus its ONNX Runtime
+// arena, measured at roughly 360 MB resident and flat across pages. The budget
+// is rounded up from that so a container is never sized into the OOM reaper.
+const WORKER_MEMORY_BUDGET = 420 * 1024 * 1024;
 const usableMemory = (() => {
   const available = (globalThis as { process?: { availableMemory?: () => number } }).process?.availableMemory;
   const free = typeof available === 'function' ? available() : freemem();
-  // Leave room for the HTTP server, Poppler, and the rest of the host. Node no
-  // longer carries the recognition heap itself, so this reserve is smaller than
-  // it had to be for the WASM engine.
-  return Math.max(0, Math.min(free, totalmem()) - 256 * 1024 * 1024);
+  // Leave room for Node itself, Poppler, and the rest of the host.
+  return Math.max(0, Math.min(free, totalmem()) - 320 * 1024 * 1024);
 })();
 const memoryBoundConcurrency = Math.max(1, Math.floor(usableMemory / WORKER_MEMORY_BUDGET));
-const defaultOcrConcurrency = Math.max(1, Math.min(8, cpuCount - 1, memoryBoundConcurrency));
+
+/**
+ * How many pages are recognised at once.
+ *
+ * This used to be `cpuCount - 1`, which evaluates to zero -- and is then
+ * clamped to one -- on every single-CPU plan, so production ran one page at a
+ * time however much work was queued while a developer laptop ran eight. OCR
+ * now lives in its own service with no HTTP traffic to protect, so the whole
+ * CPU allowance is used and a one-core plan is described honestly as one page.
+ */
+const defaultOcrConcurrency = Math.max(1, Math.min(8, cpuCount, memoryBoundConcurrency));
 
 const ocrConcurrency = positiveInteger(process.env.OCR_CONCURRENCY, defaultOcrConcurrency, 32);
 
@@ -146,37 +147,72 @@ export const config = {
     requestTimeoutMs: positiveInteger(process.env.DO_SPACES_REQUEST_TIMEOUT_MS, 120_000),
   },
   tempDir: path.resolve(baseDir, process.env.TEMP_DIR ?? './tmp'),
+  // The languages the upload form offers. They select the recognition script;
+  // PP-OCRv5's Latin model covers both English and Azerbaijani, so the choice
+  // no longer changes which model is loaded, and the values are kept only so
+  // existing clients and stored documents stay valid.
   tesseractLanguages: [...new Set([
     'eng',
     'aze',
     'aze+eng',
     ...(process.env.TESSERACT_LANGS ?? '').split(',').map((value) => value.trim()).filter(Boolean),
   ])],
-  tessdataPath: process.env.TESSDATA_PATH,
-  renderDpi: Math.max(120, Number(process.env.OCR_RENDER_DPI ?? 260)),
-  // Oversized scans (large-format or poster-sized pages) would rasterise into
-  // 20+ megapixel images at a fixed DPI, which costs several seconds per page
-  // in both Poppler and Tesseract without improving recognition. Pages larger
-  // than this budget are rendered at a lower DPI; A4 at 260 DPI is 6.5 MP and
-  // is therefore never downscaled.
+
+  // --- Recognition engine -------------------------------------------------
+  pythonBin: process.env.PYTHON_BIN ?? 'python3',
+  pythonDir: path.resolve(moduleDir, '../python'),
+  ocrModelDir: process.env.PPOCR_MODEL_DIR ?? path.resolve(moduleDir, '../models'),
+  // Threads inside one daemon. Pages are already run in parallel, and giving
+  // each daemon a single thread measured faster than the reverse split: four
+  // one-thread daemons finish four pages in the time one four-thread daemon
+  // finishes about one and a half.
+  ocrThreadsPerWorker: positiveInteger(process.env.PPOCR_THREADS, 1, 16),
+  // Longest side the detector sees. It downsamples internally, so this trades
+  // small-text recall against detection time; 1600 reads broadsheet body copy.
+  ocrDetectionMaxSide: positiveInteger(process.env.PPOCR_DET_MAX_SIDE, 1600),
+  ocrStartupTimeoutMs: positiveInteger(process.env.PPOCR_STARTUP_TIMEOUT_MS, 120_000),
+  // A page that has not come back by now is treated as a lost daemon rather
+  // than a slow one, so a single pathological page cannot hold a slot forever.
+  ocrPageTimeoutMs: positiveInteger(process.env.PPOCR_PAGE_TIMEOUT_MS, 180_000),
+
+  // --- Rasterisation ------------------------------------------------------
+  renderDpi: Math.max(120, Number(process.env.OCR_RENDER_DPI ?? 200)),
+  // Oversized pages are rendered below OCR_RENDER_DPI so a single page never
+  // rasterises past this many pixels. A4 at 200 DPI is 3.9 MP.
   maxRenderPixels: positiveInteger(process.env.OCR_MAX_PAGE_PIXELS, 12_000_000),
   minRenderDpi: positiveInteger(process.env.OCR_MIN_RENDER_DPI, 150),
-  // Recognition slots shared by every document in the batch. A single large
-  // PDF can use all of them, so one big upload is as fast as many small ones.
+  renderJpegQuality: Math.min(100, Math.max(40, positiveInteger(process.env.OCR_JPEG_QUALITY, 88))),
+  renderTimeoutMs: positiveInteger(process.env.OCR_RENDER_TIMEOUT_MS, 120_000),
+
+  // --- Throughput ---------------------------------------------------------
   ocrConcurrency,
-  // Documents are only a scheduling unit now; the recognition slots above are
-  // what actually limits CPU use. Allowing several documents at once keeps the
-  // slots busy when a batch is made of one- and two-page files.
-  documentConcurrency: positiveInteger(process.env.OCR_DOCUMENT_CONCURRENCY, Math.max(2, ocrConcurrency), 32),
-  // Poppler competes with Tesseract for the same cores, so rendering runs at a
-  // lower width and is overlapped with recognition instead of blocking it.
-  // Never more rasterisers than the container has CPU for: on a one-core plan a
-  // second Poppler process only takes time away from recognition.
+  // Poppler competes with the recogniser for the same cores, so rendering runs
+  // at roughly half the recognition width and is overlapped with it. JPEG
+  // output made rasterising cheap enough that it is no longer the limit.
   renderConcurrency: positiveInteger(
     process.env.OCR_RENDER_CONCURRENCY,
     Math.max(1, Math.min(cpuCount, Math.ceil(ocrConcurrency / 2))),
     32,
   ),
+
+  // --- Page queue ---------------------------------------------------------
+  // Pages are claimed in runs so one PDF is opened and downloaded once per
+  // batch instead of once per page.
+  pageClaimSize: positiveInteger(process.env.OCR_PAGE_CLAIM_SIZE, Math.max(4, ocrConcurrency * 2), 64),
+  maxPageAttempts: positiveInteger(process.env.OCR_MAX_PAGE_ATTEMPTS, 3, 10),
+  queuePollIntervalMs: positiveInteger(process.env.OCR_POLL_INTERVAL_MS, 2_000),
+  // A page still marked as running after this long belongs to a worker that
+  // was redeployed or killed, and is offered to the pool again.
+  staleLockMs: positiveInteger(process.env.OCR_STALE_LOCK_MS, 10 * 60_000),
+  documentCacheEntries: positiveInteger(process.env.OCR_PDF_CACHE_ENTRIES, 4, 32),
+  /**
+   * Runs the page worker inside the API process. Off in production, where the
+   * worker is its own Render service and OCR must not compete with HTTP for
+   * the CPU; on by default elsewhere so `npm run dev` is still a single
+   * command.
+   */
+  runWorkerInProcess: (process.env.RUN_OCR_IN_API ?? (process.env.NODE_ENV === 'production' ? 'false' : 'true')) !== 'false',
+
   uploadStorageConcurrency: positiveInteger(process.env.UPLOAD_STORAGE_CONCURRENCY, 4, 8),
   maxUploadBytes: Number(process.env.MAX_UPLOAD_MB ?? 50) * 1024 * 1024,
   maxBatchFiles: positiveInteger(process.env.MAX_BATCH_FILES, 30),

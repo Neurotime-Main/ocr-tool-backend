@@ -19,6 +19,40 @@ const legacyAzeriBytes: Readonly<Record<number, string>> = {
   0xF8: 'ş', 0xF9: 'h', 0xFA: 'c', 0xFB: 'ı', 0xFC: 'ğ', 0xFD: 'g', 0xFE: 'ö', 0xFF: 'ə',
 };
 
+// A second legacy Azerbaijani font family maps its glyphs through Cyrillic
+// code points instead of the 0xC0-0xFF range above. PDF.js surfaces those
+// bytes as real Cyrillic letters, so `ийул` is the word `iyul` drawn with a
+// font whose `и` glyph is a Latin `i`. Mastheads and date lines in the same
+// documents use it alongside the byte-range font.
+const legacyAzeriCyrillic: Readonly<Record<string, string>> = {
+  а: 'a', б: 'b', в: 'v', г: 'q', ғ: 'ğ', д: 'd', е: 'e', ә: 'ə', я: 'ə',
+  ж: 'j', з: 'z', и: 'i', ы: 'ı', й: 'y', к: 'k', ҝ: 'g', л: 'l', м: 'm',
+  н: 'n', о: 'o', ө: 'ö', п: 'p', р: 'r', с: 's', т: 't', у: 'u', ү: 'ü',
+  ф: 'f', х: 'x', һ: 'h', ч: 'ç', ҹ: 'c', ш: 'ş', ъ: 'ə', э: 'e', ю: 'yu',
+  А: 'A', Б: 'B', В: 'V', Г: 'Q', Ғ: 'Ğ', Д: 'D', Е: 'E', Ә: 'Ə', Я: 'Ə',
+  Ж: 'J', З: 'Z', И: 'I', Ы: 'I', Й: 'Y', К: 'K', Ҝ: 'G', Л: 'L', М: 'M',
+  Н: 'N', О: 'O', Ө: 'Ö', П: 'P', Р: 'R', С: 'S', Т: 'T', У: 'U', Ү: 'Ü',
+  Ф: 'F', Х: 'X', Һ: 'H', Ч: 'Ç', Ҹ: 'C', Ш: 'Ş', Ъ: 'Ə', Э: 'E', Ю: 'Yu',
+};
+
+const isCyrillic = (character: string) => {
+  const code = character.codePointAt(0) ?? 0;
+  return code >= 0x400 && code <= 0x4FF;
+};
+
+/**
+ * True when a run of Cyrillic code points is really Latin Azerbaijani drawn
+ * with a Cyrillic-encoded font. Genuine Russian text is left alone, because it
+ * leans on letters this Azerbaijani font never uses (`ё`, `щ`, `ъ` as a sign,
+ * `ы` after consonants only) and is far longer than a masthead line.
+ */
+export function hasLegacyAzeriCyrillicEncoding(text: string) {
+  const cyrillic = [...text].filter(isCyrillic);
+  if (cyrillic.length < 3) return false;
+  const mappable = cyrillic.filter((character) => legacyAzeriCyrillic[character] != null).length;
+  return mappable / cyrillic.length >= 0.9;
+}
+
 export function hasLegacyAzeriFontEncoding(text: string) {
   const nonWhitespace = [...text].filter((character) => !/\s/u.test(character));
   const legacyCharacters = nonWhitespace.filter((character) => {
@@ -30,9 +64,59 @@ export function hasLegacyAzeriFontEncoding(text: string) {
   return legacyCharacters >= 3 && legacyCharacters / Math.max(1, nonWhitespace.length) >= 0.12;
 }
 
+export type LegacyEncodings = { bytes: boolean; cyrillic: boolean };
+
+/**
+ * Works out which legacy font encodings a run of text is using.
+ *
+ * Detection needs a whole page, not a word. Both tests are ratios over a body
+ * of text, and the documents that use these fonts are typeset in justified
+ * columns broken across syllables, so a large share of their "words" are two
+ * characters long -- far too little to tell a broken code page from ordinary
+ * accented Latin. Callers therefore detect once and map many times.
+ */
+export function detectLegacyEncodings(text: string): LegacyEncodings {
+  const bytes = hasLegacyAzeriFontEncoding(text);
+  return {
+    bytes,
+    // A document drawn with the byte-range font uses the Cyrillic-mapped one
+    // for its masthead and dates, where there is rarely enough text to detect
+    // it on its own. Finding either is good enough reason to decode both.
+    cyrillic: bytes || hasLegacyAzeriCyrillicEncoding(text),
+  };
+}
+
+/** Applies the chosen legacy maps to one fragment, without re-detecting. */
+export function applyLegacyEncodings(text: string, encodings: LegacyEncodings) {
+  let repaired = text;
+  if (encodings.bytes) {
+    repaired = [...repaired].map((character) => legacyAzeriBytes[character.codePointAt(0) ?? -1] ?? character).join('');
+  }
+  if (encodings.cyrillic) {
+    repaired = [...repaired].map((character) => legacyAzeriCyrillic[character] ?? character).join('');
+  }
+  return repaired;
+}
+
 function repairLegacyAzeriFont(text: string) {
-  if (!hasLegacyAzeriFontEncoding(text)) return text;
-  return [...text].map((character) => legacyAzeriBytes[character.codePointAt(0) ?? -1] ?? character).join('');
+  return applyLegacyEncodings(text, detectLegacyEncodings(text));
+}
+
+/**
+ * Decodes both legacy Azerbaijani font encodings into real Unicode. The
+ * extraction path calls this before deciding whether a page needs OCR: these
+ * PDFs carry a complete, correctly positioned text layer that only looks like
+ * mojibake, and reading it is several hundred times cheaper than recognising a
+ * rasterised copy of the same page.
+ */
+export function repairLegacyEncodings(text: string) {
+  return repairLegacyAzeriFont(text);
+}
+
+/** True when either legacy font encoding is present. */
+export function hasLegacyEncoding(text: string) {
+  const { bytes, cyrillic } = detectLegacyEncodings(text);
+  return bytes || cyrillic;
 }
 
 /** Keep valid Unicode (including Azerbaijani) while removing characters that
