@@ -3,7 +3,7 @@ import cors from 'cors';
 import multer from 'multer';
 import path from 'node:path';
 import { mkdir, mkdtemp, rm, unlink } from 'node:fs/promises';
-import { config } from './config.js';
+import { config, describeRuntime } from './config.js';
 import { prisma } from './db.js';
 import { storage } from './storage.js';
 import { checkOcrEngine } from './ocrEngine.js';
@@ -16,11 +16,19 @@ import { createFindingsWorkbook } from './excelReport.js';
 import { documentIdsSchema, documentSearchSchema, highlightListSchema } from './validation.js';
 import { buildStoredFindings, searchDocuments } from './search.js';
 
+console.log(describeRuntime('api'));
 await ensureWorkerDirectories();
 // In production the recognition worker is its own Render service, so that OCR
 // never takes CPU away from HTTP. Everywhere else it runs here, which keeps
 // local development to a single command.
 if (config.runWorkerInProcess) startOcrWorker();
+else {
+  console.log(
+    '[boot] OCR runs in the separate markwise-ocr-worker service. If documents stay PENDING, that '
+    + 'service is missing, crash-looping, or pointed at a different DATABASE_URL. GET /api/health '
+    + 'reports the queue state.',
+  );
+}
 
 const app = express();
 app.set('trust proxy', 1);
@@ -153,7 +161,7 @@ app.post('/api/documents', upload.single('file'), async (request, response, next
     storageKey = await storage.saveTemporaryFile(request.file.path);
     const language = String(request.body.language ?? 'eng');
     const ocrMode = String(request.body.ocrMode ?? 'AUTO').toUpperCase();
-    if (!config.tesseractLanguages.includes(language)) {
+    if (!config.ocrLanguages.includes(language)) {
       await storage.delete(storageKey);
       return response.status(400).json({ error: `Unsupported OCR language: ${language}` });
     }
@@ -184,7 +192,7 @@ app.post('/api/documents/batch', upload.array('files', config.maxBatchFiles), as
     if (!files?.length) return response.status(400).json({ error: 'Choose one or more PDFs to upload.' });
     const language = String(request.body.language ?? 'eng');
     const ocrMode = String(request.body.ocrMode ?? 'AUTO').toUpperCase();
-    if (!config.tesseractLanguages.includes(language)) {
+    if (!config.ocrLanguages.includes(language)) {
       return response.status(400).json({ error: `Unsupported OCR language: ${language}` });
     }
     if (!['AUTO', 'FORCE_OCR'].includes(ocrMode)) {

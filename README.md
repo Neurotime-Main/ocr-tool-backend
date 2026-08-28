@@ -4,9 +4,7 @@ Standalone Node.js/Express backend for batch OCR processing, highlight persisten
 
 ## Production architecture
 
-- **Render:** two services built from one Docker image.
-  - `markwise-api` (web) serves uploads, status, search and export. It runs no OCR.
-  - `markwise-ocr-worker` (worker) reads pages off the queue. Scale this one to make batches finish sooner.
+- **Render:** one Docker web service. It serves HTTP and reads the OCR queue in the same process. (Recognition can be split into its own worker later — see "Scaling up" — but that is not the default.)
 - **Neon:** PostgreSQL through Prisma. It also holds the work queue.
 - **DigitalOcean Spaces (`ams3`):** private storage for uploaded source PDFs, reached through the S3 SDK. Render's filesystem holds only temporary page images.
 - **PaddleOCR PP-OCRv5** on ONNX Runtime, in a Python daemon beside the worker. The models ship inside the image, so no page ever leaves the container.
@@ -92,36 +90,113 @@ Pages written before `searchText` existed carry an empty value and are always tr
 
 Excel reports include the PDF filename, page number, inferred article/page title, keyword, matched text, surrounding context, match type, OCR confidence, and user note. Heading inference uses word geometry and returns an empty title when no reliable heading is available. Export values are cleaned for UTF-8/XLSX compatibility, preserve Azerbaijani characters, repair common encoding corruption, and are protected from accidental Excel formulas.
 
-## Local development
+## Setup
 
-Install Poppler and Python first (`poppler-utils` and `python3` on Debian/Ubuntu), then:
+### What you need installed
+
+| | Why | Where it comes from |
+| --- | --- | --- |
+| **Poppler** (`pdftoppm`) | Turns a PDF page into an image for OCR | Docker image; locally `apt-get install poppler-utils` |
+| **Python 3** | Runs the PaddleOCR recognition daemon | Docker image; locally `apt-get install python3 python3-venv` |
+| **PaddleOCR models** (~13 MB) | The recognition weights | Downloaded at image build; locally `npm run setup:python` |
+
+Nothing else. There is no OCR service to sign up for and no API key: every page
+is read inside your own container.
+
+### Why Python at all
+
+The whole app is Node except one piece. PaddleOCR's PP-OCRv5 models are
+published for Python, and the surrounding maths -- the DB text-detection
+post-process, the perspective crop of each text line, the CTC decode -- exists
+as tested library code there (OpenCV, NumPy, pyclipper) and nowhere usable in
+Node. Reimplementing contour finding and polygon offsetting in TypeScript to
+avoid one dependency would be a lot of subtly wrong code.
+
+So `python/ppocr_daemon.py` is a long-lived process that Node starts and talks
+to over stdin/stdout, one JSON line per page. It holds no state, no queue and no
+database connection. If it crashes it is killed and replaced, and its page is
+retried. **PaddlePaddle itself is not installed** -- the models run on ONNX
+Runtime, which starts in a fraction of a second and holds several hundred
+megabytes less per process, so more pages fit on a small container.
+
+### Local
 
 ```bash
-cp .env.example .env
-docker compose up -d postgres
+cd backend
+cp .env.example .env          # then fill in DATABASE_URL / DIRECT_URL
 npm install
 npm run prisma:migrate
 
-# The recognition daemon's runtime, and the PaddleOCR models it loads.
-python3 -m venv .venv
-.venv/bin/pip install -r python/requirements.txt
-.venv/bin/python python/download_models.py ./models
-export PYTHON_BIN="$PWD/.venv/bin/python"
+npm run setup:python          # venv + dependencies + models, one command
+#   prints the PYTHON_BIN line to paste into .env
 
+npm run doctor                # checks everything and names the fix for anything missing
 npm run dev
 ```
 
-`npm run dev` runs the worker inside the API process. To mirror production, set
-`RUN_OCR_IN_API=false` and start the worker separately with `npm run dev:worker`.
+`npm run doctor` is the thing to run whenever something is wrong. It checks the
+database, the schema, storage, Poppler, the models, the recognition engine and
+the queue, and prints the exact command that fixes whatever is broken.
 
-For the Docker PostgreSQL service, replace both database variables in `.env` with:
+### Render
 
-```dotenv
-DATABASE_URL="postgresql://postgres:postgres@localhost:5432/ocr_highlighter?schema=public"
-DIRECT_URL="postgresql://postgres:postgres@localhost:5432/ocr_highlighter?schema=public"
-```
+**One service. Docker.** Do not create a second one.
 
-Local file storage is selected with `STORAGE_DRIVER=local`. Use `STORAGE_DRIVER=s3` to test AWS storage locally.
+1. **New → Web Service**, point it at this repository, **Runtime: Docker**,
+   root directory `backend`, health check path `/api/health`.
+2. **Plan: Standard or better.** One page is recognised per CPU core, and one
+   core is reserved for HTTP, so a 1-CPU plan leaves nothing for OCR.
+3. Set the environment variables below.
+4. Deploy. The container runs `prisma migrate deploy` before starting, so the
+   schema is applied for you.
+5. Open `/api/health`. It should report `"ok": true` and `"queue": {"stalled":
+   false}`. If it does not, the response names the failing dependency.
+
+| Variable | Value | Required |
+| --- | --- | --- |
+| `DATABASE_URL` | Neon **pooled** string (host contains `-pooler`), `?sslmode=require` | yes |
+| `DIRECT_URL` | Neon **direct** string, used by migrations | yes |
+| `CLIENT_ORIGIN` | your Vercel origin, comma-separated for several | yes |
+| `STORAGE_DRIVER` | `spaces` | yes |
+| `DO_SPACES_BUCKET` | the Space name alone, no URL | yes |
+| `DO_SPACES_ENDPOINT` | `https://ams3.digitaloceanspaces.com` | yes |
+| `DO_SPACES_REGION` | `ams3` — must match the endpoint host | yes |
+| `DO_SPACES_KEY` / `DO_SPACES_SECRET` | Spaces key pair, **not** AWS IAM | yes |
+| `DO_SPACES_PREFIX` | `documents` | no |
+| `DO_SPACES_FORCE_PATH_STYLE` | `true` | no |
+| `DO_SPACES_DISABLE_CHECKSUMS` | `true` — Spaces rejects the SDK's chunked framing | no |
+| `MAX_BATCH_FILES` / `MAX_UPLOAD_MB` | `30` / `50` | no |
+| `OCR_CONCURRENCY` | pages at once; defaults to cores − 1 | no |
+| `PPOCR_DET_MAX_SIDE` | `1600`; lower to `1280` for ~⅓ faster, less small text | no |
+| `NODE_ENV` | set by the Dockerfile | no |
+
+`STORAGE_DRIVER=spaces` is **not optional in production**. Render erases the
+service's disk on every deploy, so locally stored PDFs would not survive one.
+The process refuses to start without it rather than losing uploads later.
+
+### What goes wrong, and how it looks
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Documents stay `PENDING` forever | Nothing is reading the queue | `/api/health` → `queue.lastClaimSeconds: null`. Usually `RUN_OCR_IN_API=false` with no worker service. Unset it. |
+| Every page: *the stored PDF is missing* | `STORAGE_DRIVER` is not `spaces` | Set it and the `DO_SPACES_*` variables. Re-upload — the old files are gone. |
+| *The OCR engine could not be started* | No Python, or `PYTHON_BIN` points nowhere | Locally `npm run setup:python`. On Render this means the service is not the Docker image. |
+| *The PDF page renderer is not installed* | No Poppler | Same cause as above: not built from the Dockerfile. |
+| Health check fails on deploy | A dependency is down | The `/api/health` body names which one. |
+| Batch is slow, CPU pinned | Too few cores | Raise the plan, or lower `PPOCR_DET_MAX_SIDE` to `1280`. |
+| Deploy killed a running batch | Normal | In-flight pages return to the queue and resume. Nothing is lost. |
+
+### Scaling up
+
+Recognition can move to its own service once OCR volume justifies it: same
+image, `dockerCommand: node dist/worker.js`, **every environment variable
+copied across**, and `RUN_OCR_IN_API=false` on the web service. The worker
+refuses to start if its storage or engine is misconfigured rather than failing
+page by page.
+
+Do this only when API latency actually suffers during batches. Two services is
+two sets of variables to keep in step, and every production failure this project
+has had came from them drifting apart.
 
 ## Neon setup
 
@@ -162,40 +237,6 @@ To move to real AWS S3 instead, unset `DO_SPACES_ENDPOINT`, set `DO_SPACES_FORCE
 
 This MVP has no user authentication, so add it before accepting untrusted public uploads.
 
-## Deploy to Render
-
-1. Push this `backend` directory as its own Git repository.
-2. In Render, create a Blueprint from the repository. `render.yaml` selects the Docker runtime, the Frankfurt region, the `standard` plan, and the `/api/health` check.
-3. Fill in the secret variables the Blueprint asks for (everything below marked *secret*).
-4. Deploy, then confirm `https://YOUR-SERVICE.onrender.com/api/health` returns `"ok": true` with both `database: "connected"` and `storage.ok: true`.
-
-Render supplies `PORT` itself. Never commit AWS or Neon secrets.
-
-### Render environment variables
-
-| Variable | Value | |
-| --- | --- | --- |
-| `NODE_ENV` | `production` | in `render.yaml` |
-| `DATABASE_URL` | Neon **pooled** string (host contains `-pooler`), `?sslmode=require` | *secret* |
-| `DIRECT_URL` | Neon **direct** string, `?sslmode=require` | *secret* |
-| `CLIENT_ORIGIN` | `https://YOUR-APP.vercel.app,https://YOUR-APP-*.vercel.app` | *secret* |
-| `STORAGE_DRIVER` | `spaces` | in `render.yaml` |
-| `DO_SPACES_BUCKET` | the Space name alone | *secret* |
-| `DO_SPACES_ENDPOINT` | `https://ams3.digitaloceanspaces.com` | in `render.yaml` |
-| `DO_SPACES_REGION` | `ams3` | in `render.yaml` |
-| `DO_SPACES_FORCE_PATH_STYLE` | `true` | in `render.yaml` |
-| `DO_SPACES_DISABLE_CHECKSUMS` | `true` | in `render.yaml` |
-| `DO_SPACES_KEY` | Spaces access key | *secret* |
-| `DO_SPACES_SECRET` | Spaces secret | *secret* |
-| `DO_SPACES_PREFIX` | `documents` | in `render.yaml` |
-| `MAX_BATCH_FILES` / `MAX_UPLOAD_MB` | `30` / `50` | in `render.yaml` |
-| `OCR_RENDER_DPI` / `OCR_MAX_PAGE_PIXELS` | `260` / `12000000` | in `render.yaml` |
-| `OCR_CONCURRENCY` | leave unset | sized from CPU and free memory |
-
-The service refuses to start with a named-variable error if any of the required ones are missing, rather than failing on the first upload.
-
-**Plan sizing.** Recognition is a native `tesseract` process per page, holding the page raster and its language model. On Starter (512 MB) the pool still sizes itself down to one page at a time; `standard` (2 GB) is the realistic floor for 30-file batches, and CPU is what decides how long a page takes. Because the pool is capped by the cgroup CPU quota, a fractional-CPU plan recognizes one page at a time no matter how many cores the host reports. Starter and free instances also spin down when idle, which adds a cold start to the first upload and drops any queued OCR — the queue is recovered on restart, but the wait is real.
-
 ## Deploy the frontend to Vercel
 
 The frontend is a separate Vercel project pointed at this API.
@@ -210,12 +251,12 @@ Preview deployments get a new hostname per branch, which is why `CLIENT_ORIGIN` 
 
 ## Commands
 
-```bash
-npm run typecheck
-npm run build
-npm run prisma:generate
-npm run prisma:deploy
-npm audit --omit=dev
-```
-
-For higher traffic, move `processDocument` into a durable background worker/queue. The current in-process job is appropriate for the MVP but can be interrupted by a service restart or deployment.
+| Command | What it does |
+| --- | --- |
+| `npm run dev` | API and OCR worker together, with reload |
+| `npm run doctor` | Checks every dependency and names the fix for anything broken |
+| `npm run setup:python` | Creates the Python runtime and downloads the models |
+| `npm run build` / `npm start` | Compile / run the compiled server |
+| `npm run prisma:migrate` | Apply migrations locally |
+| `npm run prisma:deploy` | Apply migrations in production (the container does this on boot) |
+| `npm run start:worker` | Standalone OCR worker, for the split deployment only |

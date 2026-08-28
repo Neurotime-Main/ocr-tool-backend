@@ -9,8 +9,8 @@ RUN npm run build
 
 FROM node:22-bookworm-slim AS runtime
 
-# poppler-utils rasterises pages; python3 runs the recognition daemon. Tesseract
-# is deliberately absent -- recognition is now PaddleOCR PP-OCRv5 on ONNX
+# poppler-utils rasterises pages; python3 runs the recognition daemon. No OCR
+# engine is installed system-wide: recognition is PaddleOCR PP-OCRv5 on ONNX
 # Runtime, which reads these documents both faster and far more accurately.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

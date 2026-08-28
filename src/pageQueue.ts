@@ -73,11 +73,45 @@ export async function claimPages(limit: number): Promise<ClaimedPage[]> {
  */
 export async function releaseStalePages() {
   const cutoff = new Date(Date.now() - config.staleLockMs);
-  const { count } = await prisma.ocrPage.updateMany({
+
+  // A page abandoned on its final attempt must be retired, not offered again.
+  // Returning it to PENDING with its attempts already spent would put it in a
+  // state the claim query filters out, so nothing would ever pick it up and its
+  // document would report PROCESSING forever. A worker being killed part-way
+  // through its last attempt is routine -- it is what every deploy does -- so
+  // this is the difference between a batch that finishes and one that never
+  // does.
+  const retired = await prisma.ocrPage.updateMany({
+    where: {
+      status: 'PROCESSING',
+      startedAt: { lt: cutoff },
+      attempts: { gte: config.maxPageAttempts },
+    },
+    data: {
+      status: 'FAILED',
+      error: 'The worker reading this page stopped before it finished, and no attempts were left.',
+      lockedBy: null,
+      startedAt: null,
+    },
+  });
+
+  const returned = await prisma.ocrPage.updateMany({
     where: { status: 'PROCESSING', startedAt: { lt: cutoff } },
     data: { status: 'PENDING', lockedBy: null, startedAt: null },
   });
-  return count;
+
+  // Rows already stranded by an earlier release, before the rule above existed.
+  const rescued = await prisma.ocrPage.updateMany({
+    where: { status: 'PENDING', attempts: { gte: config.maxPageAttempts } },
+    data: {
+      status: 'FAILED',
+      error: 'This page ran out of attempts while a worker was being restarted.',
+      lockedBy: null,
+      startedAt: null,
+    },
+  });
+
+  return retired.count + returned.count + rescued.count;
 }
 
 export async function pendingPageCount() {

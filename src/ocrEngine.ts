@@ -59,6 +59,12 @@ class Daemon {
       const error = new OcrEngineError(`${reason}${this.lastStderr.length ? `: ${this.lastStderr.slice(-4).join(' | ')}` : ''}`);
       for (const [, waiter] of this.pending) waiter.reject(error);
       this.pending.clear();
+      // A process that dies before it reports itself ready has to fail the
+      // startup promise too. Without this the caller waits out the full startup
+      // timeout and is then told the engine "did not become ready", which hides
+      // the exit code and traceback that say why -- the single least helpful
+      // message this class can produce.
+      this.readyReject(error);
     };
     child.on('exit', (code, signal) => fail(`The OCR engine stopped (code ${code ?? 'null'}, signal ${signal ?? 'none'})`));
     child.on('error', (error) => fail(`The OCR engine could not be started (${error.message})`));

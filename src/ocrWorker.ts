@@ -1,7 +1,8 @@
 import { mkdir } from 'node:fs/promises';
-import { config } from './config.js';
+import { config, describeRuntime, isSpacesDriver } from './config.js';
 import { prisma } from './db.js';
-import { shutdownOcrEngine } from './ocrEngine.js';
+import { checkOcrEngine, shutdownOcrEngine } from './ocrEngine.js';
+import { checkRenderer } from './render.js';
 import {
   backfillPages, claimPages, refreshDocumentStatus, releasePages, releaseStalePages,
   type ClaimedPage,
@@ -174,11 +175,38 @@ export async function ensureWorkerDirectories() {
 
 /** Entry point for the standalone worker service. */
 export async function runWorkerService() {
+  console.log(describeRuntime('worker'));
+
+  // A standalone worker never receives an upload, so a local storage directory
+  // of its own is empty by definition: every PDF it is asked for was written by
+  // the API, in a different container, onto a disk this process cannot see.
+  // Checked here rather than only in the production guard because the give-away
+  // symptom -- every page failing with "the stored PDF is missing" -- says
+  // nothing about the setting that caused it, and because a worker deployed
+  // outside the Dockerfile has no NODE_ENV for that guard to key on.
+  if (!isSpacesDriver(config.storageDriver)) {
+    throw new Error(
+      `The OCR worker cannot run with STORAGE_DRIVER='${config.storageDriver}'. It reads PDFs that the `
+      + 'API stored, and a local directory is not shared between the two services. Set '
+      + 'STORAGE_DRIVER=spaces on this service, along with DO_SPACES_BUCKET, DO_SPACES_ENDPOINT, '
+      + 'DO_SPACES_REGION, DO_SPACES_KEY and DO_SPACES_SECRET -- the same values the API uses.',
+    );
+  }
+
   await ensureWorkerDirectories();
   const storageStatus = await storage.check();
   if (!storageStatus.ok) {
     throw new Error(`Storage is not reachable (${storageStatus.driver}): ${storageStatus.detail}`);
   }
+
+  // The recogniser and the rasteriser are installed by the Dockerfile. A worker
+  // deployed on a plain Node runtime has neither, and would otherwise take
+  // pages off the queue only to fail every one of them.
+  const [engine, renderer] = await Promise.all([checkOcrEngine(), checkRenderer()]);
+  if (!engine.ok) throw new Error(`The OCR engine is not usable on this service: ${engine.detail}`);
+  if (!renderer.ok) throw new Error(`The PDF renderer is not usable on this service: ${renderer.detail}`);
+  console.log(`[boot] engine=${engine.detail} renderer=${renderer.detail}`);
+
   startOcrWorker();
 
   const shutdown = async () => {

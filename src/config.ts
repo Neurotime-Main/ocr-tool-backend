@@ -40,17 +40,16 @@ export function assertRuntimeEnvironment() {
       `STORAGE_DRIVER=spaces requires ${missing.join(', ')}. Set them on the service, or use STORAGE_DRIVER=local for a machine with a persistent disk.`,
     );
   }
-  // The API and the recognition worker are separate containers with separate
-  // ephemeral disks, so a PDF the API writes locally is a file the worker can
-  // never open. That used to work only because both ran in one process. This is
-  // fatal at boot rather than on the first page, because otherwise the symptom
-  // is every page of every upload failing with a message about a missing file.
+  // Render gives a service a fresh, empty disk on every deploy, so a PDF stored
+  // locally is gone the next time the code changes -- along with any batch that
+  // was still being read. Fatal at boot rather than on the first page, because
+  // otherwise it surfaces much later as pages failing with a missing file.
   if (process.env.NODE_ENV === 'production' && !isSpacesDriver(process.env.STORAGE_DRIVER)) {
     throw new Error(
       `STORAGE_DRIVER is '${process.env.STORAGE_DRIVER ?? 'local'}', which cannot work in production: `
-      + 'the API and the OCR worker run as separate services and do not share a disk, so the worker '
-      + 'cannot read the PDFs the API stores. Set STORAGE_DRIVER=spaces together with DO_SPACES_BUCKET, '
-      + 'DO_SPACES_ENDPOINT, DO_SPACES_REGION, DO_SPACES_KEY and DO_SPACES_SECRET on BOTH services.',
+      + "the host's disk is erased on every deploy, so uploaded PDFs would not survive one, and a "
+      + 'separate OCR worker could never read them at all. Set STORAGE_DRIVER=spaces together with '
+      + 'DO_SPACES_BUCKET, DO_SPACES_ENDPOINT, DO_SPACES_REGION, DO_SPACES_KEY and DO_SPACES_SECRET.',
     );
   }
   if (process.env.NODE_ENV === 'production' && !process.env.CLIENT_ORIGIN) {
@@ -123,7 +122,29 @@ const memoryBoundConcurrency = Math.max(1, Math.floor(usableMemory / WORKER_MEMO
  * now lives in its own service with no HTTP traffic to protect, so the whole
  * CPU allowance is used and a one-core plan is described honestly as one page.
  */
-const defaultOcrConcurrency = Math.max(1, Math.min(8, cpuCount, memoryBoundConcurrency));
+/**
+ * Whether this process reads the queue itself.
+ *
+ * Defaults to on, everywhere. Splitting recognition into its own service is the
+ * right shape once OCR volume justifies it, but it is a second deployment to
+ * keep in step -- same image, same database, same storage credentials -- and
+ * getting any of that wrong fails silently, with documents queueing forever or
+ * every page reporting a missing file. One service that works beats two that
+ * might. Set RUN_OCR_IN_API=false on the API once a dedicated worker exists.
+ */
+const runWorkerInProcess = (process.env.RUN_OCR_IN_API ?? 'true') !== 'false';
+
+/**
+ * How many pages are recognised at once.
+ *
+ * A dedicated worker serves no HTTP and can use every core. Sharing the process
+ * with the API cannot: recognition would starve the health check that Render
+ * gates deploys on, turning a slow batch into a restart loop. So a core is held
+ * back in that case -- which on a single-CPU plan honestly means one page at a
+ * time, and is the reason to move to two cores before anything else.
+ */
+const usableCores = runWorkerInProcess ? Math.max(1, cpuCount - 1) : cpuCount;
+const defaultOcrConcurrency = Math.max(1, Math.min(8, usableCores, memoryBoundConcurrency));
 
 const ocrConcurrency = positiveInteger(process.env.OCR_CONCURRENCY, defaultOcrConcurrency, 32);
 
@@ -160,15 +181,20 @@ export const config = {
     requestTimeoutMs: positiveInteger(process.env.DO_SPACES_REQUEST_TIMEOUT_MS, 120_000),
   },
   tempDir: path.resolve(baseDir, process.env.TEMP_DIR ?? './tmp'),
-  // The languages the upload form offers. They select the recognition script;
-  // PP-OCRv5's Latin model covers both English and Azerbaijani, so the choice
-  // no longer changes which model is loaded, and the values are kept only so
-  // existing clients and stored documents stay valid.
-  tesseractLanguages: [...new Set([
+  /**
+   * The language values the upload form may send.
+   *
+   * PP-OCRv5's Latin model covers English and Azerbaijani together, so this no
+   * longer selects a model -- it is kept so that existing clients and every
+   * document already in the database stay valid. `TESSERACT_LANGS` is still
+   * read so a service configured before the engine changed keeps booting.
+   */
+  ocrLanguages: [...new Set([
     'eng',
     'aze',
     'aze+eng',
-    ...(process.env.TESSERACT_LANGS ?? '').split(',').map((value) => value.trim()).filter(Boolean),
+    ...(process.env.OCR_LANGUAGES ?? process.env.TESSERACT_LANGS ?? '')
+      .split(',').map((value) => value.trim()).filter(Boolean),
   ])],
 
   // --- Recognition engine -------------------------------------------------
@@ -218,15 +244,32 @@ export const config = {
   // was redeployed or killed, and is offered to the pool again.
   staleLockMs: positiveInteger(process.env.OCR_STALE_LOCK_MS, 10 * 60_000),
   documentCacheEntries: positiveInteger(process.env.OCR_PDF_CACHE_ENTRIES, 4, 32),
-  /**
-   * Runs the page worker inside the API process. Off in production, where the
-   * worker is its own Render service and OCR must not compete with HTTP for
-   * the CPU; on by default elsewhere so `npm run dev` is still a single
-   * command.
-   */
-  runWorkerInProcess: (process.env.RUN_OCR_IN_API ?? (process.env.NODE_ENV === 'production' ? 'false' : 'true')) !== 'false',
+  runWorkerInProcess,
 
   uploadStorageConcurrency: positiveInteger(process.env.UPLOAD_STORAGE_CONCURRENCY, 4, 8),
   maxUploadBytes: Number(process.env.MAX_UPLOAD_MB ?? 50) * 1024 * 1024,
   maxBatchFiles: positiveInteger(process.env.MAX_BATCH_FILES, 30),
 };
+
+/**
+ * A one-line summary of what this process will actually do, logged at boot.
+ *
+ * Every production failure so far has been a service configured differently
+ * from the one next to it -- a worker without the storage credentials, or built
+ * from a Node runtime rather than the Dockerfile, so with no Python and no
+ * models. None of that is visible until a page fails, and the failure names a
+ * missing file rather than the missing setting behind it. Printing the
+ * effective settings makes the first ten lines of a deploy log enough to tell.
+ */
+export function describeRuntime(role: 'api' | 'worker') {
+  return [
+    `[boot] role=${role}`,
+    `nodeEnv=${process.env.NODE_ENV ?? '(unset)'}`,
+    `storage=${config.storageDriver}${isSpacesDriver(config.storageDriver) ? `:${config.spaces.bucket}` : `:${config.storageDir}`}`,
+    `workerInApi=${config.runWorkerInProcess}`,
+    `ocrConcurrency=${config.ocrConcurrency}`,
+    `renderConcurrency=${config.renderConcurrency}`,
+    `python=${config.pythonBin}`,
+    `models=${config.ocrModelDir}`,
+  ].join(' ');
+}
