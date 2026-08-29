@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import path from 'node:path';
-import { config } from './config.js';
+import { config, type OcrScript } from './config.js';
 import type { OcrWord } from './types.js';
 
 export type RecognizedLine = {
@@ -123,7 +123,7 @@ class Daemon {
 
   get isBroken() { return this.broken; }
 
-  async recognize(imagePath: string, maxSide: number, signal: AbortSignal): Promise<RecognizedLine[]> {
+  async recognize(imagePath: string, maxSide: number, languages: OcrScript[], signal: AbortSignal): Promise<RecognizedLine[]> {
     await this.ensureStarted();
     const id = String(nextRequestId++);
     return new Promise<RecognizedLine[]>((resolve, reject) => {
@@ -146,7 +146,7 @@ class Daemon {
         resolve: (lines) => { clearTimeout(timer); signal.removeEventListener('abort', onAbort); resolve(lines); },
         reject: (error) => { clearTimeout(timer); signal.removeEventListener('abort', onAbort); reject(error); },
       });
-      this.child!.stdin.write(`${JSON.stringify({ id, image: imagePath, maxSide })}\n`, (error) => {
+      this.child!.stdin.write(`${JSON.stringify({ id, image: imagePath, maxSide, languages })}\n`, (error) => {
         if (!error) return;
         this.pending.delete(id);
         clearTimeout(timer);
@@ -196,7 +196,7 @@ class DaemonPool {
     else this.idle.push(index);
   }
 
-  async run(imagePath: string, maxSide: number, signal: AbortSignal) {
+  async run(imagePath: string, maxSide: number, languages: OcrScript[], signal: AbortSignal) {
     const index = await this.acquire();
     this.cancelIdleTimer(index);
     try {
@@ -206,7 +206,7 @@ class DaemonPool {
         this.daemons[index] = daemon;
       }
       try {
-        return await daemon.recognize(imagePath, maxSide, signal);
+        return await daemon.recognize(imagePath, maxSide, languages, signal);
       } catch (error) {
         // Retire a daemon that failed, so the slot comes back clean. The page
         // itself is retried by the queue, on a fresh process.

@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import path from 'node:path';
 import type { Prisma } from '@prisma/client';
-import { config } from './config.js';
+import { config, ocrScriptsForLanguage } from './config.js';
 import { prisma } from './db.js';
 import { lineToWords, ocrPool } from './ocrEngine.js';
 import { normalizeForSearch } from './normalize.js';
@@ -301,7 +301,7 @@ export async function processPage(page: ClaimedPage, signal: AbortSignal) {
       // raster actually holds would only cost time.
       const maxSide = Math.min(config.ocrDetectionMaxSide, Math.max(imageWidth, imageHeight));
       const recognizeStartedAt = Date.now();
-      const lines = await ocrPool().run(imagePath, maxSide, signal);
+      const lines = await ocrPool().run(imagePath, maxSide, ocrScriptsForLanguage(page.ocrLanguage), signal);
       const recognizeMs = Date.now() - recognizeStartedAt;
 
       const words: OcrWord[] = lines.flatMap((line, index) => lineToWords(line, page.pageNumber, index));

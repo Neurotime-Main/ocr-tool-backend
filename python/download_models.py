@@ -2,7 +2,7 @@
 Fetches the PaddleOCR PP-OCRv5 models the daemon runs.
 
 They are pulled at image build time rather than vendored into git: together
-they are about 13 MB, and keeping them out of the repository means a model
+they are about 21 MB, and keeping them out of the repository means a model
 upgrade is a rebuild rather than a commit. Each file is size-checked, because a
 truncated download would otherwise surface much later as an ONNX parse error on
 the first page a worker touches.
@@ -21,6 +21,9 @@ MODELS = {
     # weights, which cover English and Azerbaijani Latin.
     "rec_latin.onnx": (f"{HUGGINGFACE}/itextresearch/itext-latin_PP-OCRv5_mobile_rec_infer/resolve/main/inference.onnx", 7_000_000),
     "rec_latin.yml": (f"{HUGGINGFACE}/itextresearch/itext-latin_PP-OCRv5_mobile_rec_infer/resolve/main/inference.yml", 3_000),
+    # Cyrillic PP-OCRv5 covers Russian, Belarusian and Ukrainian.
+    "rec_cyrillic.onnx": (f"{HUGGINGFACE}/itextresearch/itext-cyrillic_PP-OCRv5_mobile_rec_infer/resolve/main/inference.onnx", 7_000_000),
+    "rec_cyrillic.yml": (f"{HUGGINGFACE}/itextresearch/itext-cyrillic_PP-OCRv5_mobile_rec_infer/resolve/main/inference.yml", 3_000),
 }
 
 

@@ -59,6 +59,10 @@ Recognition is CPU bound and each page uses one core, so **pages in parallel is 
 | `OCR_STALE_LOCK_MS` | `600000` | How long a claimed page may be silent before another worker may take it. |
 | `RUN_OCR_IN_API` | `true` | Runs the worker inside the API process. Leave it on for the one-service deployment in `render.yaml`; set it to false only after creating a separate worker. |
 
+The upload form accepts Azerbaijani, English, and Russian independently. English and Azerbaijani use the shared Latin recognizer; Russian uses PaddleOCR's Cyrillic PP-OCRv5 recognizer. When Latin and Russian are both selected, each detected line is tested with both relevant recognizers and the higher-confidence result is kept, so mixed-script pages take longer than one-script pages.
+
+**Automatic** first reads a PDF's embedded text layer and sends only scanned or unusable pages to PaddleOCR. It is the normal, fast choice. **Complex layouts** forces image OCR for every page. Use it when selecting/copying text from a PDF is garbled, missing, or ordered incorrectly because of fonts, columns, or graphic layouts; it is slower because even good text-layer pages are rasterized and recognized.
+
 ### Why PaddleOCR, and why not Tesseract
 
 Measured on a broadsheet page from `storage/`, single-threaded, same machine:
@@ -98,7 +102,7 @@ Excel reports include the PDF filename, page number, inferred article/page title
 | --- | --- | --- |
 | **Poppler** (`pdftoppm`) | Turns a PDF page into an image for OCR | Docker image; locally `apt-get install poppler-utils` |
 | **Python 3** | Runs the PaddleOCR recognition daemon | Docker image; locally `apt-get install python3 python3-venv` |
-| **PaddleOCR models** (~13 MB) | The recognition weights | Downloaded at image build; locally `npm run setup:python` |
+| **PaddleOCR models** (~21 MB) | Latin and Cyrillic recognition weights | Downloaded at image build; locally `npm run setup:python` |
 
 Nothing else. There is no OCR service to sign up for and no API key: every page
 is read inside your own container.

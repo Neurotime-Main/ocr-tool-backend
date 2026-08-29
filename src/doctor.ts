@@ -65,7 +65,7 @@ add('PDF renderer (Poppler)', renderer.ok, renderer.detail,
     : 'Install it: `sudo apt-get install -y poppler-utils` (macOS: `brew install poppler`). The Docker image installs it already.');
 
 // --- Recognition models ---------------------------------------------------
-const models = ['det.onnx', 'cls.onnx', 'rec_latin.onnx', 'rec_latin.yml'];
+const models = ['det.onnx', 'cls.onnx', 'rec_latin.onnx', 'rec_latin.yml', 'rec_cyrillic.onnx', 'rec_cyrillic.yml'];
 const missingModels: string[] = [];
 for (const name of models) {
   await access(path.join(config.ocrModelDir, name)).catch(() => missingModels.push(name));

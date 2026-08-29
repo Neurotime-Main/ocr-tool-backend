@@ -15,6 +15,41 @@ dotenv.config({ path: path.resolve(moduleDir, '../.env'), quiet: true });
 /** `s3` remains accepted so a service configured before the rename still boots. */
 export const isSpacesDriver = (driver: string | undefined) => driver === 'spaces' || driver === 's3';
 
+export const OCR_LANGUAGE_CODES = ['aze', 'eng', 'rus'] as const;
+export type OcrLanguageCode = typeof OCR_LANGUAGE_CODES[number];
+export type OcrScript = 'latin' | 'cyrillic';
+
+const OCR_LANGUAGE_ALIASES: Record<string, OcrLanguageCode> = {
+  az: 'aze',
+  aze: 'aze',
+  en: 'eng',
+  eng: 'eng',
+  ru: 'rus',
+  rus: 'rus',
+};
+
+/** Normalizes old `aze+eng` values and multi-select form values alike. */
+export function parseOcrLanguages(value: string | undefined) {
+  const tokens = (value ?? '').toLowerCase().split(/[+,]/).map((token) => token.trim()).filter(Boolean);
+  if (!tokens.length) return null;
+  const languages = tokens.map((token) => OCR_LANGUAGE_ALIASES[token]);
+  if (languages.some((language) => !language)) return null;
+  return OCR_LANGUAGE_CODES.filter((language) => languages.includes(language));
+}
+
+export function serializeOcrLanguages(languages: OcrLanguageCode[]) {
+  return OCR_LANGUAGE_CODES.filter((language) => languages.includes(language)).join('+');
+}
+
+/** Azerbaijani and English share the Latin recognizer; Russian needs Cyrillic. */
+export function ocrScriptsForLanguage(value: string): OcrScript[] {
+  const languages = parseOcrLanguages(value) ?? ['eng'];
+  const scripts: OcrScript[] = [];
+  if (languages.some((language) => language === 'aze' || language === 'eng')) scripts.push('latin');
+  if (languages.includes('rus')) scripts.push('cyrillic');
+  return scripts.length ? scripts : ['latin'];
+}
+
 /**
  * Fails the process at boot with an actionable message rather than letting a
  * misconfigured deploy surface as a Prisma or AWS SDK error on the first
@@ -219,22 +254,6 @@ export const config = {
     requestTimeoutMs: positiveInteger(process.env.DO_SPACES_REQUEST_TIMEOUT_MS, 120_000),
   },
   tempDir: path.resolve(baseDir, process.env.TEMP_DIR ?? './tmp'),
-  /**
-   * The language values the upload form may send.
-   *
-   * PP-OCRv5's Latin model covers English and Azerbaijani together, so this no
-   * longer selects a model -- it is kept so that existing clients and every
-   * document already in the database stay valid. `TESSERACT_LANGS` is still
-   * read so a service configured before the engine changed keeps booting.
-   */
-  ocrLanguages: [...new Set([
-    'eng',
-    'aze',
-    'aze+eng',
-    ...(process.env.OCR_LANGUAGES ?? process.env.TESSERACT_LANGS ?? '')
-      .split(',').map((value) => value.trim()).filter(Boolean),
-  ])],
-
   // --- Recognition engine -------------------------------------------------
   pythonBin: process.env.PYTHON_BIN ?? 'python3',
   pythonDir: path.resolve(moduleDir, '../python'),

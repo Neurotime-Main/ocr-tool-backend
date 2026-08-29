@@ -3,7 +3,7 @@ import cors from 'cors';
 import multer from 'multer';
 import path from 'node:path';
 import { mkdir, mkdtemp, rm, unlink } from 'node:fs/promises';
-import { config, describeRuntime } from './config.js';
+import { config, describeRuntime, parseOcrLanguages, serializeOcrLanguages } from './config.js';
 import { prisma } from './db.js';
 import { storage } from './storage.js';
 import { checkOcrEngine } from './ocrEngine.js';
@@ -178,11 +178,11 @@ app.post('/api/documents', upload.single('file'), async (request, response, next
   try {
     if (!request.file) return response.status(400).json({ error: 'Choose a PDF to upload.' });
     storageKey = await storage.saveTemporaryFile(request.file.path);
-    const language = String(request.body.language ?? 'eng');
+    const languages = parseOcrLanguages(String(request.body.language ?? 'eng'));
     const ocrMode = String(request.body.ocrMode ?? 'AUTO').toUpperCase();
-    if (!config.ocrLanguages.includes(language)) {
+    if (!languages) {
       await storage.delete(storageKey);
-      return response.status(400).json({ error: `Unsupported OCR language: ${language}` });
+      return response.status(400).json({ error: 'Choose one or more supported OCR languages.' });
     }
     if (!['AUTO', 'FORCE_OCR'].includes(ocrMode)) {
       await storage.delete(storageKey);
@@ -193,7 +193,7 @@ app.post('/api/documents', upload.single('file'), async (request, response, next
         originalName: request.file.originalname,
         storageKey,
         size: request.file.size,
-        ocrLanguage: language,
+        ocrLanguage: serializeOcrLanguages(languages),
         ocrMode,
         queueNamespace: config.queueNamespace,
       },
@@ -210,10 +210,10 @@ app.post('/api/documents/batch', upload.array('files', config.maxBatchFiles), as
   const files = request.files as Express.Multer.File[] | undefined;
   try {
     if (!files?.length) return response.status(400).json({ error: 'Choose one or more PDFs to upload.' });
-    const language = String(request.body.language ?? 'eng');
+    const languages = parseOcrLanguages(String(request.body.language ?? 'eng'));
     const ocrMode = String(request.body.ocrMode ?? 'AUTO').toUpperCase();
-    if (!config.ocrLanguages.includes(language)) {
-      return response.status(400).json({ error: `Unsupported OCR language: ${language}` });
+    if (!languages) {
+      return response.status(400).json({ error: 'Choose one or more supported OCR languages.' });
     }
     if (!['AUTO', 'FORCE_OCR'].includes(ocrMode)) {
       return response.status(400).json({ error: `Unsupported OCR mode: ${ocrMode}` });
@@ -231,7 +231,7 @@ app.post('/api/documents/batch', upload.array('files', config.maxBatchFiles), as
             originalName: file.originalname,
             storageKey,
             size: file.size,
-            ocrLanguage: language,
+            ocrLanguage: serializeOcrLanguages(languages),
             ocrMode,
             queueNamespace: config.queueNamespace,
           },

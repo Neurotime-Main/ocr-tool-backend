@@ -230,11 +230,11 @@ class Engine:
             AngleClassifier(os.path.join(MODEL_DIR, "cls.onnx")) if USE_ANGLE_CLS else None
         )
 
-    def recognizer(self, language):
+    def recognizer(self, script):
         """Recognition models are per script and loaded the first time they are
         asked for, so a deployment that only ever sees one language never pays
         for the others."""
-        name = "latin" if language != "cyrillic" else "cyrillic"
+        name = "cyrillic" if script == "cyrillic" else "latin"
         if name not in self.recognizers:
             self.recognizers[name] = Recognizer(
                 os.path.join(MODEL_DIR, f"rec_{name}.onnx"),
@@ -242,7 +242,7 @@ class Engine:
             )
         return self.recognizers[name]
 
-    def read(self, image_path, max_side, language):
+    def read(self, image_path, max_side, scripts):
         image = cv2.imread(image_path, cv2.IMREAD_COLOR)
         if image is None:
             raise ValueError(f"Could not read the rendered page at {image_path}")
@@ -262,10 +262,15 @@ class Engine:
         if self.classifier is not None:
             crops = self.classifier(crops)
 
-        recognizer = self.recognizer(language)
+        recognizers = [self.recognizer(script) for script in scripts if script in ("latin", "cyrillic")]
+        if not recognizers:
+            recognizers = [self.recognizer("latin")]
         lines = []
         for box, crop in zip(keep, crops):
-            text, score = recognizer(crop)
+            # A page can contain both Latin and Russian text. Each selected
+            # script reads the same crop and the stronger recognition score is
+            # retained, while Azerbaijani and English share one Latin pass.
+            text, score = max((recognizer(crop) for recognizer in recognizers), key=lambda result: result[1])
             if not text or score < REC_MIN_SCORE:
                 continue
             left = float(np.min(box[:, 0]))
@@ -300,7 +305,7 @@ def main():
             lines = engine.read(
                 request["image"],
                 int(request.get("maxSide", DET_LIMIT)),
-                request.get("language", "latin"),
+                request.get("languages", ["latin"]),
             )
             response = {"id": request_id, "lines": lines}
         except Exception as error:  # noqa: BLE001 - reported to the caller instead

@@ -37,10 +37,9 @@ COPY python ./python
 COPY --from=build /app/dist ./dist
 
 # The official PaddleOCR PP-OCRv5 models: mobile text detection, the 180-degree
-# orientation classifier, and the Latin recognition model, which covers both
-# English and Azerbaijani. Roughly 13 MB in total, baked into the image so a
-# cold worker starts recognising without reaching the network, and so no page
-# ever leaves this container.
+# orientation classifier, and Latin/Cyrillic recognition models. Latin covers
+# English and Azerbaijani; Cyrillic covers Russian. Roughly 21 MB in total,
+# baked into the image so a cold worker starts without reaching the network.
 ENV PPOCR_MODEL_DIR=/app/models
 RUN mkdir -p storage tmp \
     && $VIRTUAL_ENV/bin/python python/download_models.py $PPOCR_MODEL_DIR
@@ -48,7 +47,7 @@ RUN mkdir -p storage tmp \
 # Fails the build rather than the first upload if a model is unreadable.
 RUN $VIRTUAL_ENV/bin/python -c "\
 import onnxruntime as ort, os; d=os.environ['PPOCR_MODEL_DIR']; \
-[ort.InferenceSession(os.path.join(d,n), providers=['CPUExecutionProvider']) for n in ('det.onnx','cls.onnx','rec_latin.onnx')]; \
+[ort.InferenceSession(os.path.join(d,n), providers=['CPUExecutionProvider']) for n in ('det.onnx','cls.onnx','rec_latin.onnx','rec_cyrillic.onnx')]; \
 print('PaddleOCR models load correctly')"
 
 EXPOSE 4000
