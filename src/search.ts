@@ -67,14 +67,53 @@ type FlatLine = {
   owner: number[];
   startsWord: boolean[];
   endsWord: boolean[];
+  /** Per word: the real word it belongs to runs on past this box. */
+  continuesBefore: boolean[];
+  continuesAfter: boolean[];
   words: OcrWord[];
 };
 
-function flattenLine(line: OcrWord[]): FlatLine {
+/** A word broken across lines keeps its hyphen: `azal-` / `dilmasi`. */
+const TRAILING_DASH = /\p{Pd}$/u;
+
+/**
+ * Below this fraction of the text height, the space between two boxes is not a
+ * space at all -- they are two glyph runs of one word.
+ */
+const GLUED_GAP = 0.08;
+
+function flattenLine(line: OcrWord[], previousLine?: OcrWord[]): FlatLine {
   let text = '';
   const owner: number[] = [];
   const startsWord: boolean[] = [];
   const endsWord: boolean[] = [];
+
+  // Whether each box is really the whole word, or part of one. A PDF text layer
+  // splits a word wherever the font changes, and a justified column hyphenates
+  // across lines; in both cases the pieces sit flush against each other with no
+  // room for a space. Without this, "azal" matches inside "azaltmaq" and across
+  // "azal-" / "dilmasi", because each fragment starts and ends a box.
+  const continuesBefore = line.map(() => false);
+  const continuesAfter = line.map(() => false);
+  for (let index = 0; index < line.length - 1; index += 1) {
+    const left = line[index]!;
+    const right = line[index + 1]!;
+    const gap = right.x - (left.x + left.width);
+    const scale = Math.max(left.height, right.height, Number.EPSILON);
+    if (gap < scale * GLUED_GAP) {
+      continuesAfter[index] = true;
+      continuesBefore[index + 1] = true;
+    }
+  }
+  // A hyphen at the end of the line means the word finishes on the next one.
+  const last = line.length - 1;
+  if (last >= 0 && TRAILING_DASH.test(line[last]!.text.trim())) continuesAfter[last] = true;
+  // ...and the line after a hyphenated one opens mid-word.
+  if (line.length && previousLine?.length) {
+    const previous = previousLine[previousLine.length - 1]!;
+    if (TRAILING_DASH.test(previous.text.trim())) continuesBefore[0] = true;
+  }
+
   line.forEach((word, wordIndex) => {
     const normalized = normalizeForSearch(word.text);
     for (let index = 0; index < normalized.length; index += 1) {
@@ -84,7 +123,7 @@ function flattenLine(line: OcrWord[]): FlatLine {
       endsWord.push(index === normalized.length - 1);
     }
   });
-  return { text, owner, startsWord, endsWord, words: line };
+  return { text, owner, startsWord, endsWord, continuesBefore, continuesAfter, words: line };
 }
 
 /**
@@ -96,13 +135,15 @@ function flattenLine(line: OcrWord[]): FlatLine {
  * break words across syllables -- `şəbəkələrdən` is set as `şə bə kə lər dən`
  * -- and PDF text layers routinely split one word into several glyph runs, so a
  * word-by-word comparison silently misses matches that are plainly visible on
- * the page. Requiring the match to begin at a word start and end at a word end
- * keeps that from over-matching into the middle of longer words.
+ * the page. Requiring the match to fill whole words -- and those words not to
+ * be fragments glued to a neighbour -- keeps that from over-matching into the
+ * middle of longer words, so "azal" finds the airline and not "azaltmaq".
  */
 export function findPageMatches(page: PageData, keywords: string[], documentId: string) {
   const words = page.words as OcrWord[];
   if (!words?.length) return [];
-  const lines = groupWordsIntoLines(words).map(flattenLine);
+  const grouped = groupWordsIntoLines(words);
+  const lines = grouped.map((line, index) => flattenLine(line, grouped[index - 1]));
   const matches: StoredHighlight[] = [];
 
   for (const keyword of keywords) {
@@ -115,7 +156,10 @@ export function findPageMatches(page: PageData, keywords: string[], documentId: 
         if (at === -1) break;
         from = at + 1;
         const end = at + needle.length - 1;
+        // The match has to fill whole words, and those words must not be
+        // fragments of a longer one.
         if (!line.startsWord[at] || !line.endsWord[end]) continue;
+        if (line.continuesBefore[line.owner[at]!] || line.continuesAfter[line.owner[end]!]) continue;
         const covered = new Set(line.owner.slice(at, end + 1));
         const occurrence = [...covered].sort((a, b) => a - b).map((index) => line.words[index]!);
         if (!occurrence.length) continue;

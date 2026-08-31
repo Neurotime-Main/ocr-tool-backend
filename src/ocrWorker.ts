@@ -4,7 +4,8 @@ import { prisma } from './db.js';
 import { checkOcrEngine, shutdownOcrEngine } from './ocrEngine.js';
 import { checkRenderer } from './render.js';
 import {
-  backfillPages, claimPages, refreshDocumentStatus, releasePages, releaseStalePages,
+  backfillPages, claimPages, reconcileDocumentStatuses, refreshDocumentStatus, releasePages,
+  releaseStalePages,
   type ClaimedPage,
 } from './pageQueue.js';
 import { normalizeForSearch } from './normalize.js';
@@ -178,6 +179,10 @@ async function maintenanceLoop(signal: AbortSignal) {
     try {
       const recovered = await releaseStalePages();
       if (recovered) console.log(`[ocr] recovered ${recovered} abandoned page(s)`);
+      // A document whose last page finished while its worker was dying never
+      // had its status refreshed, and would otherwise stay PROCESSING forever.
+      const reconciled = await reconcileDocumentStatuses();
+      if (reconciled) console.log(`[ocr] finished ${reconciled} document(s) whose pages were already done`);
       const upgraded = await backfillPages(normalizeForSearch);
       if (upgraded) {
         console.log(`[ocr] upgraded ${upgraded} stored page(s)`);

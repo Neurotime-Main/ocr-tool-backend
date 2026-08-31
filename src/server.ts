@@ -2,8 +2,10 @@ import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import path from 'node:path';
-import { mkdir, mkdtemp, rm, unlink } from 'node:fs/promises';
-import { config, describeRuntime, parseOcrLanguages, serializeOcrLanguages } from './config.js';
+import { mkdir, rm, stat, unlink } from 'node:fs/promises';
+import {
+  config, describeRuntime, OCR_LANGUAGE_CODES, parseOcrLanguages, serializeOcrLanguages, type OcrLanguageCode,
+} from './config.js';
 import { prisma } from './db.js';
 import { storage } from './storage.js';
 import { checkOcrEngine } from './ocrEngine.js';
@@ -11,10 +13,16 @@ import { checkRenderer } from './render.js';
 import { ensureWorkerDirectories, startOcrWorker, stopOcrWorker } from './ocrWorker.js';
 import { getOcrProgress, requeueDocument } from './documents.js';
 import { getQueueHealth } from './pageQueue.js';
-import { addHighlightsToPdf } from './exportPdf.js';
-import { createFindingsWorkbook } from './excelReport.js';
+import {
+  ACCEPTED_EXTENSIONS, checkConverter, convertToPdf, imageToPdf, isAcceptedUpload, isImageUpload,
+  needsConversion, pdfNameFor,
+} from './convert.js';
+import { fetchNewsKeywords } from './keywords.js';
+import { ImageRecognitionError, recognizeImageFile } from './recognizeImage.js';
+import { publishDocuments } from './publish.js';
+import { checkServerDb, serverDbConfigured } from './serverDb.js';
 import { documentIdsSchema, documentSearchSchema, highlightListSchema } from './validation.js';
-import { buildStoredFindings, searchDocuments } from './search.js';
+import { searchDocuments } from './search.js';
 
 console.log(describeRuntime('api'));
 await ensureWorkerDirectories();
@@ -47,7 +55,13 @@ function isAllowedOrigin(origin: string) {
 app.use(cors({
   origin(origin, callback) {
     if (!origin || isAllowedOrigin(origin)) return callback(null, true);
-    callback(new Error('Origin is not allowed by CORS.'));
+    // Name both sides. The old message said only that the origin was refused,
+    // which is the one fact the reader already has; what they need is the
+    // origin the browser actually sent and the list it was compared against.
+    callback(new Error(
+      `Origin ${origin} is not allowed. CLIENT_ORIGIN currently allows: ${config.clientOrigins.join(', ') || '(nothing)'}. `
+      + 'Add this origin to CLIENT_ORIGIN, comma-separated and without a trailing slash.',
+    ));
   },
 }));
 app.use(express.json({ limit: '10mb' }));
@@ -58,13 +72,59 @@ const upload = multer({
   dest: uploadDir,
   limits: { fileSize: config.maxUploadBytes, files: config.maxBatchFiles },
   fileFilter: (_request, file, callback) => {
-    if (file.mimetype !== 'application/pdf' && !file.originalname.toLowerCase().endsWith('.pdf')) {
-      callback(new Error('Only PDF files are supported.'));
+    if (!isAcceptedUpload(file.originalname, file.mimetype)) {
+      callback(new Error(`Unsupported file type. Accepted: ${ACCEPTED_EXTENSIONS.join(', ')}.`));
       return;
     }
     callback(null, true);
   },
 });
+
+/**
+ * Turns one uploaded file into a stored document.
+ *
+ * A Word or spreadsheet upload is converted to PDF first and recorded under the
+ * converted name, so the rest of the system -- pages, highlights, published
+ * images -- only ever deals with PDFs. The temporary files from both the upload
+ * and the conversion are cleaned up whichever way this goes.
+ */
+async function storeUpload(file: Express.Multer.File, options: {
+  languages: OcrLanguageCode[];
+  ocrMode: string;
+}) {
+  let sourcePath = file.path;
+  let converted: string | undefined;
+
+  if (isImageUpload(file.originalname, file.mimetype)) {
+    // A photograph or scan becomes a one-page PDF at its own resolution.
+    converted = await imageToPdf(file.path, file.originalname);
+    sourcePath = converted;
+  } else if (needsConversion(file.originalname)) {
+    converted = await convertToPdf(file.path, file.originalname);
+    sourcePath = converted;
+  }
+
+  try {
+    const storageKey = await storage.saveTemporaryFile(sourcePath);
+    const { size } = converted ? await stat(converted).catch(() => ({ size: file.size })) : file;
+    const document = await prisma.document.create({
+      data: {
+        originalName: pdfNameFor(file.originalname),
+        storageKey,
+        size,
+        ocrLanguage: serializeOcrLanguages(options.languages),
+        ocrMode: options.ocrMode,
+        queueNamespace: config.queueNamespace,
+      },
+    });
+    return { document, storageKey };
+  } finally {
+    // `saveTemporaryFile` consumes the file it is given; the other one, and the
+    // conversion's working directory, are ours to remove.
+    if (converted) await rm(path.dirname(converted), { recursive: true, force: true }).catch(() => undefined);
+    await unlink(file.path).catch(() => undefined);
+  }
+}
 
 const documentInclude = {
   pages: { orderBy: { pageNumber: 'asc' as const } },
@@ -114,12 +174,14 @@ app.get('/api/health', async (_request, response) => {
   // the service cannot work without. A broken bucket policy, a wrong region, or
   // an image missing the OCR binary then fails the deploy instead of surfacing
   // on a user's first upload.
-  const [database, storageStatus, ocrEngine, renderer, queue] = await Promise.all([
+  const [database, storageStatus, ocrEngine, renderer, converter, queue, serverDb] = await Promise.all([
     prisma.$queryRaw`SELECT 1`.then(() => 'connected' as const).catch(() => 'unavailable' as const),
     storage.check(),
     checkOcrEngine(),
     checkRenderer(),
+    checkConverter(),
     getQueueHealth().catch(() => null),
+    checkServerDb(),
   ]);
   const ok = database === 'connected' && storageStatus.ok && ocrEngine.ok && renderer.ok;
   response.status(ok ? 200 : 503).json({
@@ -137,6 +199,18 @@ app.get('/api/health', async (_request, response) => {
     renderer: {
       ok: renderer.ok,
       ...(renderer.ok ? { engine: renderer.detail } : { error: renderer.detail }),
+    },
+    // Reported but not part of `ok`: the OCR side of the service works without
+    // it, and failing the health check would take the whole API down when only
+    // keywords and publishing are affected.
+    // Not part of `ok`: PDFs work without it, only office uploads are affected.
+    officeConversion: {
+      ok: converter.ok,
+      ...(converter.ok ? { engine: converter.detail } : { error: converter.detail }),
+    },
+    neurotimeDb: {
+      ok: serverDb.ok,
+      ...(serverDb.ok ? { target: serverDb.detail } : { error: serverDb.detail }),
     },
     runtime: {
       workerInApi: config.runWorkerInProcess,
@@ -174,34 +248,22 @@ app.get('/api/health', async (_request, response) => {
 });
 
 app.post('/api/documents', upload.single('file'), async (request, response, next) => {
-  let storageKey: string | undefined;
   try {
-    if (!request.file) return response.status(400).json({ error: 'Choose a PDF to upload.' });
-    storageKey = await storage.saveTemporaryFile(request.file.path);
+    if (!request.file) return response.status(400).json({ error: 'Choose a file to upload.' });
     const languages = parseOcrLanguages(String(request.body.language ?? 'eng'));
     const ocrMode = String(request.body.ocrMode ?? 'AUTO').toUpperCase();
     if (!languages) {
-      await storage.delete(storageKey);
+      await unlink(request.file.path).catch(() => undefined);
       return response.status(400).json({ error: 'Choose one or more supported OCR languages.' });
     }
     if (!['AUTO', 'FORCE_OCR'].includes(ocrMode)) {
-      await storage.delete(storageKey);
+      await unlink(request.file.path).catch(() => undefined);
       return response.status(400).json({ error: `Unsupported OCR mode: ${ocrMode}` });
     }
-    const document = await prisma.document.create({
-      data: {
-        originalName: request.file.originalname,
-        storageKey,
-        size: request.file.size,
-        ocrLanguage: serializeOcrLanguages(languages),
-        ocrMode,
-        queueNamespace: config.queueNamespace,
-      },
-    });
+    const { document } = await storeUpload(request.file, { languages, ocrMode });
     response.status(201).json(document);
   } catch (error) {
     if (request.file) await unlink(request.file.path).catch(() => undefined);
-    if (storageKey) await storage.delete(storageKey);
     next(error);
   }
 });
@@ -209,7 +271,7 @@ app.post('/api/documents', upload.single('file'), async (request, response, next
 app.post('/api/documents/batch', upload.array('files', config.maxBatchFiles), async (request, response, next) => {
   const files = request.files as Express.Multer.File[] | undefined;
   try {
-    if (!files?.length) return response.status(400).json({ error: 'Choose one or more PDFs to upload.' });
+    if (!files?.length) return response.status(400).json({ error: 'Choose one or more files to upload.' });
     const languages = parseOcrLanguages(String(request.body.language ?? 'eng'));
     const ocrMode = String(request.body.ocrMode ?? 'AUTO').toUpperCase();
     if (!languages) {
@@ -225,18 +287,9 @@ app.post('/api/documents/batch', upload.array('files', config.maxBatchFiles), as
     const outcomes = await mapWithConcurrency(files, config.uploadStorageConcurrency, async (file) => {
       let storageKey: string | undefined;
       try {
-        storageKey = await storage.saveTemporaryFile(file.path);
-        const document = await prisma.document.create({
-          data: {
-            originalName: file.originalname,
-            storageKey,
-            size: file.size,
-            ocrLanguage: serializeOcrLanguages(languages),
-            ocrMode,
-            queueNamespace: config.queueNamespace,
-          },
-        });
-        return { document, storageKey, error: undefined };
+        const stored = await storeUpload(file, { languages, ocrMode });
+        storageKey = stored.storageKey;
+        return { document: stored.document, storageKey, error: undefined };
       } catch (error) {
         // Return failures instead of throwing inside the pool, so every
         // in-flight file settles before rollback starts.
@@ -336,6 +389,14 @@ app.get('/api/documents/:id/file', async (request, response, next) => {
     if (!document) return response.status(404).json({ error: 'Document not found.' });
     response.type('application/pdf');
     response.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(document.originalName)}`);
+    // The stored PDF never changes once uploaded -- a re-run replaces the pages,
+    // never the file -- so the browser is told it may keep it. Without this the
+    // viewer pulls the whole document from object storage again every time the
+    // operator switches between files, which on a thirty-file batch is the
+    // slowest thing in the session by a wide margin.
+    response.setHeader('Cache-Control', 'private, max-age=86400, immutable');
+    response.setHeader('ETag', `"${document.id}"`);
+    if (request.headers['if-none-match'] === `"${document.id}"`) return response.status(304).end();
     const stream = await storage.createReadStream(document.storageKey);
     stream.on('error', next).pipe(response);
   } catch (error) {
@@ -352,19 +413,6 @@ app.post('/api/documents/:id/ocr', async (request, response, next) => {
     if (!['AUTO', 'FORCE_OCR'].includes(requestedMode)) return response.status(400).json({ error: `Unsupported OCR mode: ${requestedMode}` });
     await requeueDocument(document.id, requestedMode);
     response.status(202).json({ status: 'PENDING' });
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.post('/api/reports/excel', async (request, response, next) => {
-  try {
-    const { ids } = documentIdsSchema.parse(request.body);
-    const findings = await buildStoredFindings(ids);
-    const workbook = await createFindingsWorkbook(findings);
-    response.type('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    response.setHeader('Content-Disposition', 'attachment; filename="markwise-findings.xlsx"');
-    response.send(workbook);
   } catch (error) {
     next(error);
   }
@@ -396,22 +444,122 @@ app.put('/api/documents/:id/highlights', async (request, response, next) => {
   }
 });
 
-app.post('/api/documents/:id/export', async (request, response, next) => {
+/**
+ * Keywords offered for newspapers, with the projects each belongs to.
+ *
+ * Served from the Neurotime database rather than typed by the operator, so the
+ * words searched for are exactly the ones the rest of the platform tracks.
+ */
+/**
+ * Reads one image and returns its text. Nothing is stored.
+ *
+ * The other half of this service. Everything above belongs to the document
+ * tool: upload, queue, search, publish, all of it built around pages someone
+ * will come back to. This endpoint answers a different question -- "what does
+ * this picture say?" -- for callers like the Instagram scraper, which keeps its
+ * own files and only needs the words back.
+ *
+ * Deliberately stateless: no document row, no queue entry, no object in the
+ * bucket, so a caller polling it thousands of times leaves nothing behind. It
+ * shares the recognition daemons with the document worker, which is what keeps
+ * the two from oversubscribing the machine when both are busy.
+ *
+ * POST multipart/form-data with an `image` file, optionally `languages`
+ * (default "aze+eng"; accepts "aze+eng+rus" or a comma-separated list).
+ */
+app.post('/api/ocr/image', upload.single('image'), async (request, response, next) => {
+  const uploadedPath = request.file?.path;
   try {
-    const payload = highlightListSchema.parse(request.body);
-    const document = await prisma.document.findUnique({ where: { id: request.params.id } });
-    if (!document) return response.status(404).json({ error: 'Document not found.' });
-    const workDir = await mkdtemp(path.join(config.tempDir, `export-${document.id}-`));
-    try {
-      const localPath = await storage.materialize(document.storageKey, workDir);
-      const bytes = await addHighlightsToPdf(localPath, payload.highlights);
-      const baseName = document.originalName.replace(/\.pdf$/i, '');
-      response.type('application/pdf');
-      response.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(`${baseName}-highlighted.pdf`)}`);
-      response.send(bytes);
-    } finally {
-      await rm(workDir, { recursive: true, force: true });
+    if (!request.file) {
+      return response.status(400).json({ error: 'Attach an image as the "image" field.' });
     }
+    if (!isImageUpload(request.file.originalname, request.file.mimetype)) {
+      return response.status(415).json({
+        error: `This endpoint reads images. ${request.file.originalname} is not one; `
+          + 'use POST /api/documents for PDFs and office files.',
+      });
+    }
+
+    const requested = typeof request.body?.languages === 'string' ? request.body.languages : undefined;
+    const languages = parseOcrLanguages(requested);
+    if (requested && !languages) {
+      return response.status(400).json({
+        error: `Unknown language in "${requested}". Available: ${OCR_LANGUAGE_CODES.join(', ')}.`,
+      });
+    }
+    const selected = languages ? serializeOcrLanguages(languages) : 'aze+eng';
+
+    // A caller that hangs up mid-recognition should release its daemon rather
+    // than hold one for a reply nobody will read.
+    const controller = new AbortController();
+    request.on('aborted', () => controller.abort());
+
+    const result = await recognizeImageFile(
+      request.file.path,
+      request.file.originalname,
+      selected,
+      controller.signal,
+    );
+    response.json(result);
+  } catch (error) {
+    if (error instanceof ImageRecognitionError) {
+      return response.status(422).json({ error: error.message });
+    }
+    next(error);
+  } finally {
+    if (uploadedPath) await unlink(uploadedPath).catch(() => undefined);
+  }
+});
+
+app.get('/api/keywords', async (_request, response, next) => {
+  try {
+    if (!serverDbConfigured()) {
+      return response.status(503).json({
+        error: 'The keyword source is not configured. Set the SERVER_DB_* variables on this service.',
+      });
+    }
+    const keywords = await fetchNewsKeywords();
+    response.json({ sourceTypeId: config.newsSourceTypeId, keywords });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * Publishes a document's mentions: one highlighted image per keyword per page,
+ * and one `media_results` row per project behind each of those images.
+ *
+ * Replaces the Excel and highlighted-PDF downloads. The response reports what
+ * was written, including keywords that matched but belong to no project and so
+ * produced no rows.
+ */
+/**
+ * Publishes the reviewed mentions for a whole batch.
+ *
+ * One highlighted image per keyword per page, and one `media_results` row per
+ * project behind each image. The response reports what was written and, just as
+ * importantly, which documents produced nothing and why.
+ */
+app.post('/api/documents/publish', async (request, response, next) => {
+  const controller = new AbortController();
+  request.on('aborted', () => controller.abort());
+  try {
+    if (!serverDbConfigured()) {
+      return response.status(503).json({
+        error: 'Publishing is not configured. Set the SERVER_DB_* variables on this service.',
+      });
+    }
+    const { ids } = documentIdsSchema.parse(request.body);
+    const report = await publishDocuments(ids, controller.signal);
+    if (!report.rows && report.skippedDocuments.length) {
+      // Nothing was written at all; surface the first reason rather than an
+      // empty success the operator has to go digging to understand.
+      return response.status(400).json({
+        error: `Nothing was published. ${report.skippedDocuments[0]!.originalName}: ${report.skippedDocuments[0]!.reason}`,
+        ...report,
+      });
+    }
+    response.json(report);
   } catch (error) {
     next(error);
   }
@@ -421,15 +569,22 @@ app.use((error: unknown, _request: express.Request, response: express.Response, 
   console.error(error);
   if (error instanceof multer.MulterError) {
     const message = error.code === 'LIMIT_FILE_SIZE'
-      ? 'One of the PDFs is too large.'
+      ? `One of the files is larger than the ${Math.round(config.maxUploadBytes / 1024 / 1024)} MB limit.`
       : error.code === 'LIMIT_FILE_COUNT'
-        ? `You can upload up to ${config.maxBatchFiles} PDFs at once.`
-        : error.message;
+        ? `You can upload up to ${config.maxBatchFiles} files at once.`
+        // Multer says only "Unexpected field", which does not say which field
+        // it wanted -- the one thing a caller wiring up a request needs.
+        : error.code === 'LIMIT_UNEXPECTED_FILE'
+          ? `Unexpected form field "${error.field ?? ''}". `
+            + 'POST /api/ocr/image expects the file in a field named "image"; '
+            + 'the document endpoints expect "file" or "files".'
+          : error.message;
     return response.status(400).json({ error: message });
   }
   const candidate = error as { name?: string; issues?: unknown; message?: string };
-  if (candidate.message === 'Only PDF files are supported.') return response.status(400).json({ error: candidate.message });
-  if (candidate.message === 'Origin is not allowed by CORS.') return response.status(403).json({ error: candidate.message });
+  if (candidate.message?.startsWith('Unsupported file type')) return response.status(400).json({ error: candidate.message });
+  if (candidate.name === 'ConversionError') return response.status(400).json({ error: candidate.message });
+  if (candidate.message?.startsWith('Origin ') && candidate.message.includes('is not allowed')) return response.status(403).json({ error: candidate.message });
   if (candidate.name === 'ZodError') return response.status(400).json({ error: 'Invalid request data.', details: candidate.issues });
   response.status(500).json({ error: candidate.message ?? 'Unexpected server error.' });
 });

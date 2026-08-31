@@ -1,5 +1,5 @@
 import dotenv from 'dotenv';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { availableParallelism, freemem, totalmem } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,7 +15,7 @@ dotenv.config({ path: path.resolve(moduleDir, '../.env'), quiet: true });
 /** `s3` remains accepted so a service configured before the rename still boots. */
 export const isSpacesDriver = (driver: string | undefined) => driver === 'spaces' || driver === 's3';
 
-export const OCR_LANGUAGE_CODES = ['aze', 'eng', 'rus'] as const;
+export const OCR_LANGUAGE_CODES = ['aze', 'eng', 'rus', 'uzb', 'tur'] as const;
 export type OcrLanguageCode = typeof OCR_LANGUAGE_CODES[number];
 export type OcrScript = 'latin' | 'cyrillic';
 
@@ -26,6 +26,26 @@ const OCR_LANGUAGE_ALIASES: Record<string, OcrLanguageCode> = {
   eng: 'eng',
   ru: 'rus',
   rus: 'rus',
+  uz: 'uzb',
+  uzb: 'uzb',
+  tr: 'tur',
+  tur: 'tur',
+};
+
+/**
+ * Which recognition model each language needs.
+ *
+ * Four of the five are written in Latin script and share one model; only
+ * Russian needs the Cyrillic one. Uzbek is listed as Latin because that is the
+ * alphabet in official use -- a Cyrillic Uzbek document is recognised by
+ * selecting Russian alongside it, since the two share the script.
+ */
+const OCR_LANGUAGE_SCRIPTS: Record<OcrLanguageCode, OcrScript> = {
+  aze: 'latin',
+  eng: 'latin',
+  uzb: 'latin',
+  tur: 'latin',
+  rus: 'cyrillic',
 };
 
 /** Normalizes old `aze+eng` values and multi-select form values alike. */
@@ -41,12 +61,10 @@ export function serializeOcrLanguages(languages: OcrLanguageCode[]) {
   return OCR_LANGUAGE_CODES.filter((language) => languages.includes(language)).join('+');
 }
 
-/** Azerbaijani and English share the Latin recognizer; Russian needs Cyrillic. */
+/** The distinct recognition models a language selection needs. */
 export function ocrScriptsForLanguage(value: string): OcrScript[] {
   const languages = parseOcrLanguages(value) ?? ['eng'];
-  const scripts: OcrScript[] = [];
-  if (languages.some((language) => language === 'aze' || language === 'eng')) scripts.push('latin');
-  if (languages.includes('rus')) scripts.push('cyrillic');
+  const scripts = [...new Set(languages.map((language) => OCR_LANGUAGE_SCRIPTS[language]))];
   return scripts.length ? scripts : ['latin'];
 }
 
@@ -62,7 +80,7 @@ export function assertRuntimeEnvironment() {
       'DATABASE_URL is missing. Create backend/.env from backend/.env.example and set your Neon pooled connection string.',
     );
   }
-  if (isSpacesDriver(process.env.STORAGE_DRIVER)) {
+  if (isSpacesDriver(process.env.STORAGE_DRIVER) || process.env.DO_SPACES_BUCKET) {
     if (!process.env.DO_SPACES_BUCKET) missing.push('DO_SPACES_BUCKET');
     if (!process.env.DO_SPACES_ENDPOINT) missing.push('DO_SPACES_ENDPOINT');
     if (!process.env.DO_SPACES_REGION) missing.push('DO_SPACES_REGION');
@@ -73,19 +91,21 @@ export function assertRuntimeEnvironment() {
   }
   if (missing.length) {
     throw new Error(
-      `STORAGE_DRIVER=spaces requires ${missing.join(', ')}. Set them on the service, or use STORAGE_DRIVER=local for a machine with a persistent disk.`,
+      `Object storage requires ${missing.join(', ')}. They are needed for published page images; `
+      + 'unset DO_SPACES_BUCKET entirely to run without publishing.',
     );
   }
-  // Render gives a service a fresh, empty disk on every deploy, so a PDF stored
-  // locally is gone the next time the code changes -- along with any batch that
-  // was still being read. Fatal at boot rather than on the first page, because
-  // otherwise it surfaces much later as pages failing with a missing file.
-  if (process.env.NODE_ENV === 'production' && !isSpacesDriver(process.env.STORAGE_DRIVER)) {
+  // Uploaded PDFs are working files kept on the container's own disk; only
+  // published images go to object storage. That is deliberate, so a local
+  // driver is no longer an error -- but publishing has nowhere to put its
+  // images without a bucket, so those credentials are still required in
+  // production.
+  if (process.env.NODE_ENV === 'production' && !process.env.DO_SPACES_BUCKET) {
     throw new Error(
-      `STORAGE_DRIVER is '${process.env.STORAGE_DRIVER ?? 'local'}', which cannot work in production: `
-      + "the host's disk is erased on every deploy, so uploaded PDFs would not survive one, and a "
-      + 'separate OCR worker could never read them at all. Set STORAGE_DRIVER=spaces together with '
-      + 'DO_SPACES_BUCKET, DO_SPACES_ENDPOINT, DO_SPACES_REGION, DO_SPACES_KEY and DO_SPACES_SECRET.',
+      'DO_SPACES_BUCKET is missing. Published page images are written to object storage and their '
+      + 'addresses recorded in media_results, so a bucket is required even though uploaded PDFs now '
+      + 'stay on the local disk. Set DO_SPACES_BUCKET, DO_SPACES_ENDPOINT, DO_SPACES_REGION, '
+      + 'DO_SPACES_KEY and DO_SPACES_SECRET.',
     );
   }
   if (process.env.NODE_ENV === 'production' && !process.env.CLIENT_ORIGIN) {
@@ -131,12 +151,48 @@ function cgroupCpuLimit() {
 const reportedCpuCount = (() => {
   try { return availableParallelism(); } catch { return 2; }
 })();
+
+/**
+ * Physical cores, not hyperthreads.
+ *
+ * The recogniser is dense matrix arithmetic: two threads on the two siblings of
+ * one core share that core's vector units and finish at roughly the speed one
+ * thread would, so counting hyperthreads does not buy parallelism -- it just
+ * doubles the number of threads competing for the same silicon. Measured on a
+ * 6-core/12-thread laptop, sizing the pool to 12 made a page take 73-140s that
+ * takes about 14s when the machine is not oversubscribed.
+ *
+ * Read from the kernel's topology, where each logical CPU names the physical
+ * core it sits on; counting the distinct ones gives the real figure. Absent or
+ * unreadable (a container hiding sysfs, a non-Linux host), this returns nothing
+ * and the reported count is used as before.
+ */
+function physicalCoreCount() {
+  try {
+    const cores = new Set<string>();
+    for (const entry of readdirSync('/sys/devices/system/cpu')) {
+      if (!/^cpu\d+$/.test(entry)) continue;
+      const topology = `/sys/devices/system/cpu/${entry}/topology`;
+      const socket = readFileSync(`${topology}/physical_package_id`, 'utf8').trim();
+      const core = readFileSync(`${topology}/core_id`, 'utf8').trim();
+      cores.add(`${socket}:${core}`);
+    }
+    return cores.size || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+const physicalCpuCount = physicalCoreCount();
 const cpuQuota = cgroupCpuLimit();
 const cpuCount = (() => {
-  // A fractional allowance still runs one page, just not two at once.
-  return Number.isFinite(cpuQuota)
-    ? Math.max(1, Math.min(reportedCpuCount, Math.floor(cpuQuota)))
-    : reportedCpuCount;
+  // The cgroup allowance still wins where there is one -- it describes this
+  // container, while sysfs describes the machine underneath it. A fractional
+  // allowance still runs one page, just not two at once.
+  if (Number.isFinite(cpuQuota)) {
+    return Math.max(1, Math.min(reportedCpuCount, Math.floor(cpuQuota)));
+  }
+  return Math.max(1, Math.min(reportedCpuCount, physicalCpuCount ?? reportedCpuCount));
 })();
 
 /**
@@ -164,9 +220,11 @@ function cgroupMemoryLimit() {
 }
 
 // Each recognition daemon holds the PP-OCRv5 models plus its ONNX Runtime
-// arena, measured at roughly 360 MB resident and flat across pages. The budget
-// is rounded up from that so a container is never sized into the OOM reaper.
-const WORKER_MEMORY_BUDGET = 420 * 1024 * 1024;
+// arena. A single-threaded daemon settles around 360 MB resident, but the
+// arena grows with the thread count: at three threads they were measured at
+// ~650 MB. The budget is rounded up from the multi-threaded figure, because
+// that is the shape the pool is actually sized into below.
+const WORKER_MEMORY_BUDGET = 700 * 1024 * 1024;
 
 /**
  * What is left for recognition after everything else this process does.
@@ -203,12 +261,24 @@ const runWorkerInProcess = (process.env.RUN_OCR_IN_API ?? 'true') !== 'false';
 /**
  * How many pages are recognised at once.
  *
- * The recognisers are child processes, so the OS scheduler still gives the
- * lightweight Node HTTP process time while they are busy. Reserving a whole
- * core here made a 2-CPU Render plan run only one single-threaded recogniser,
- * leaving half of the plan idle. Memory remains an independent hard cap.
+ * Pages and threads are one decision, not two: what matters is that
+ * concurrency x threads stays near the core count. Running one daemon per core
+ * looks like maximum parallelism and is not -- measured on 12 cores, eight
+ * single-threaded daemons took 28.0s per page while four three-threaded ones
+ * took about 13s. Worse, oversubscription is self-amplifying: a page slow
+ * enough to pass PPOCR_PAGE_TIMEOUT_MS is retried, which adds load, which
+ * makes the next page slower still, until the queue stops draining entirely.
+ *
+ * So each recogniser is given a few cores to itself, and the count is capped:
+ * past four concurrent pages the daemons contend more than they contribute.
+ * Memory remains an independent hard cap.
  */
-const defaultOcrConcurrency = Math.max(1, Math.min(8, cpuCount, memoryBoundConcurrency));
+const OCR_CORES_PER_PAGE = 3;
+const defaultOcrConcurrency = Math.max(1, Math.min(
+  4,
+  Math.ceil(cpuCount / OCR_CORES_PER_PAGE),
+  memoryBoundConcurrency,
+));
 
 const requestedOcrConcurrency = positiveInteger(process.env.OCR_CONCURRENCY, defaultOcrConcurrency, 32);
 // An old dashboard override must not defeat the cgroup sizing and turn a small
@@ -223,7 +293,20 @@ const renderConcurrency = Math.max(1, Math.min(requestedRenderConcurrency, cpuCo
 
 export const config = {
   port: Number(process.env.PORT ?? 4000),
-  clientOrigins: (process.env.CLIENT_ORIGIN ?? 'http://localhost:5173').split(',').map((value) => value.trim()),
+  /**
+   * Origins the browser may call this API from.
+   *
+   * Each entry is stripped of surrounding quotes and any trailing slash. An
+   * unbalanced quote in the environment file -- `CLIENT_ORIGIN="http://x` with
+   * no closing quote -- otherwise survives into the allow-list as part of the
+   * value, so the origin can never match and every request is rejected with a
+   * message that mentions neither the quote nor the origin. A quote is never
+   * part of a valid origin, so removing it costs nothing and saves an hour.
+   */
+  clientOrigins: (process.env.CLIENT_ORIGIN ?? 'http://localhost:5173')
+    .split(',')
+    .map((value) => value.trim().replace(/^["']|["']$/g, '').replace(/\/+$/, '').trim())
+    .filter(Boolean),
   storageDir: path.resolve(baseDir, process.env.STORAGE_DIR ?? './storage'),
   storageDriver: process.env.STORAGE_DRIVER ?? 'local',
   // DigitalOcean Spaces. The names below are the service's, not the SDK's: the
@@ -256,20 +339,45 @@ export const config = {
   tempDir: path.resolve(baseDir, process.env.TEMP_DIR ?? './tmp'),
   // --- Recognition engine -------------------------------------------------
   pythonBin: process.env.PYTHON_BIN ?? 'python3',
+  /**
+   * LibreOffice, used to turn uploaded Word/Excel/PowerPoint files into PDFs.
+   * Everything after the upload works in PDF pages, so converting at the door
+   * keeps one pipeline rather than two.
+   */
+  libreOfficeBin: process.env.LIBREOFFICE_BIN ?? 'soffice',
+  // A large presentation can take a while to lay out; well short of anything
+  // that would hold an upload open indefinitely.
+  conversionTimeoutMs: positiveInteger(process.env.CONVERSION_TIMEOUT_MS, 180_000),
   pythonDir: path.resolve(moduleDir, '../python'),
   ocrModelDir: process.env.PPOCR_MODEL_DIR ?? path.resolve(moduleDir, '../models'),
   // Threads inside one daemon. Pages are already run in parallel, and giving
   // each daemon a single thread measured faster than the reverse split: four
   // one-thread daemons finish four pages in the time one four-thread daemon
   // finishes about one and a half.
-  ocrThreadsPerWorker: positiveInteger(process.env.PPOCR_THREADS, 1, 16),
+  // The other half of the sizing decision above: whatever cores the pool did
+  // not spend on parallel pages are given to each recogniser instead, so the
+  // machine stays busy without being oversubscribed.
+  ocrThreadsPerWorker: positiveInteger(
+    process.env.PPOCR_THREADS,
+    Math.max(1, Math.floor(cpuCount / ocrConcurrency)),
+    16,
+  ),
   // Longest side the detector sees. It downsamples internally, so this trades
   // small-text recall against detection time; 1600 reads broadsheet body copy.
   ocrDetectionMaxSide: positiveInteger(process.env.PPOCR_DET_MAX_SIDE, 1600),
   ocrStartupTimeoutMs: positiveInteger(process.env.PPOCR_STARTUP_TIMEOUT_MS, 120_000),
   // A page that has not come back by now is treated as a lost daemon rather
   // than a slow one, so a single pathological page cannot hold a slot forever.
-  ocrPageTimeoutMs: positiveInteger(process.env.PPOCR_PAGE_TIMEOUT_MS, 180_000),
+  // How long one page may take before the recogniser is assumed to be stuck.
+  //
+  // This is a deadlock detector, not a performance budget, so it is set well
+  // above the slowest legitimate page. A broadsheet with 433 text lines was
+  // measured at 100s on an idle machine and 181s under load -- and the old
+  // 180s limit turned that into a failure: the page was killed after doing all
+  // the work, requeued, and the retry added the load that made the next page
+  // slower still. Killing a page that is merely slow is how a busy queue turns
+  // into a stuck one.
+  ocrPageTimeoutMs: positiveInteger(process.env.PPOCR_PAGE_TIMEOUT_MS, 420_000),
 
   // --- Rasterisation ------------------------------------------------------
   renderDpi: Math.max(120, Number(process.env.OCR_RENDER_DPI ?? 200)),
@@ -278,12 +386,21 @@ export const config = {
   maxRenderPixels: positiveInteger(process.env.OCR_MAX_PAGE_PIXELS, 12_000_000),
   minRenderDpi: positiveInteger(process.env.OCR_MIN_RENDER_DPI, 150),
   renderJpegQuality: Math.min(100, Math.max(40, positiveInteger(process.env.OCR_JPEG_QUALITY, 88))),
+
+  // --- Uploaded images ----------------------------------------------------
+  // A photo or scan is wrapped in a one-page PDF at upload. Anything longer
+  // than this on its longest edge is scaled down first: a 12 MP phone photo of
+  // a page carries no more readable text than a 4000px scan of it, and the
+  // extra pixels are paid for again at every rasterisation.
+  imageMaxEdge: positiveInteger(process.env.IMAGE_MAX_EDGE, 4000),
+  imageJpegQuality: Math.min(100, Math.max(40, positiveInteger(process.env.IMAGE_JPEG_QUALITY, 88))),
   renderTimeoutMs: positiveInteger(process.env.OCR_RENDER_TIMEOUT_MS, 120_000),
 
   // --- Throughput ---------------------------------------------------------
   ocrConcurrency,
   runtimeResources: {
     reportedCpuCount,
+    physicalCpuCount: physicalCpuCount ?? null,
     // Preserve a fractional cgroup allowance: Render Free is 0.1 CPU, not one
     // CPU, even though at least one job still has to be allowed to run.
     cpuQuota: Number.isFinite(cpuQuota) ? cpuQuota : null,
@@ -329,6 +446,49 @@ export const config = {
   ocrIdleTimeoutMs: positiveInteger(process.env.PPOCR_IDLE_TIMEOUT_MS, 90_000),
   runWorkerInProcess,
 
+  /**
+   * The Neurotime production database, which owns keywords, projects and
+   * `media_results`. Separate from the application's own Postgres: this service
+   * only reads from it and appends to it. See `serverDb.ts`.
+   */
+  serverDb: {
+    host: process.env.SERVER_DB_HOST ?? '',
+    port: positiveInteger(process.env.SERVER_DB_PORT, 5432),
+    user: process.env.SERVER_DB_USER ?? '',
+    password: process.env.SERVER_DB_PASSWORD ?? '',
+    database: process.env.SERVER_DB_NAME ?? '',
+    ssl: (process.env.SERVER_DB_SSLMODE ?? 'disable') !== 'disable',
+    poolSize: positiveInteger(process.env.SERVER_DB_POOL_SIZE, 4, 16),
+  },
+
+  /**
+   * Newspapers are source type 10. Keywords are offered for this type, and
+   * every published row is stamped with it.
+   */
+  newsSourceTypeId: positiveInteger(process.env.NEWS_SOURCE_TYPE_ID, 10),
+
+  /** Where published page images are stored and how their URLs are built. */
+  mediaImages: {
+    // A prefix inside the existing Space, kept apart from the source PDFs
+    // because these objects are public and those are not.
+    prefix: (process.env.MEDIA_IMAGE_PREFIX ?? 'newspaper').replace(/^\/+|\/+$/g, ''),
+    /**
+     * A custom host serving the Space, if one is ever set up.
+     *
+     * Empty by default, so published URLs use DigitalOcean's own address for
+     * the bucket. That address always resolves; a vanity domain only works once
+     * someone actually points it at the Space, and until then it produces links
+     * that look right and open for nobody.
+     */
+    baseUrl: (process.env.MEDIA_IMAGE_BASE_URL ?? '').replace(/\/+$/, ''),
+    // Rasterisation DPI for the published image. Lower than recognition needs:
+    // this is read by people, not by a model.
+    dpi: positiveInteger(process.env.MEDIA_IMAGE_DPI, 150),
+    // Long edge cap, so a broadsheet page does not become a 12 MP download.
+    maxEdge: positiveInteger(process.env.MEDIA_IMAGE_MAX_EDGE, 2200),
+    jpegQuality: Math.min(100, Math.max(40, positiveInteger(process.env.MEDIA_IMAGE_QUALITY, 82))),
+  },
+
   uploadStorageConcurrency: positiveInteger(process.env.UPLOAD_STORAGE_CONCURRENCY, 4, 8),
   maxUploadBytes: Number(process.env.MAX_UPLOAD_MB ?? 50) * 1024 * 1024,
   maxBatchFiles: positiveInteger(process.env.MAX_BATCH_FILES, 30),
@@ -348,7 +508,9 @@ export function describeRuntime(role: 'api' | 'worker') {
   return [
     `[boot] role=${role}`,
     `nodeEnv=${process.env.NODE_ENV ?? '(unset)'}`,
-    `storage=${config.storageDriver}${isSpacesDriver(config.storageDriver) ? `:${config.spaces.bucket}` : `:${config.storageDir}`}`,
+    `clientOrigins=${config.clientOrigins.join('|') || '(none)'}`,
+    `uploads=${isSpacesDriver(config.storageDriver) ? `spaces:${config.spaces.bucket}` : `local:${config.storageDir}`}`,
+    `images=${config.spaces.bucket ? `spaces:${config.spaces.bucket}/${config.mediaImages.prefix}` : '(none)'}`,
     `workerInApi=${config.runWorkerInProcess}`,
     `queueNamespace=${config.queueNamespace}`,
     `cpuQuota=${config.runtimeResources.cpuQuota ?? 'unlimited'}`,

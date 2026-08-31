@@ -126,6 +126,35 @@ export async function releaseStalePages() {
   return retired.count + returned.count + rescued.count;
 }
 
+/**
+ * Finishes documents whose pages have all settled.
+ *
+ * A document's status is refreshed by whichever worker finished its last page.
+ * If that worker died in between -- a deploy, an OOM kill, a lost connection --
+ * nothing ever looks at the document again and it reports PROCESSING for good,
+ * even though every page is done. The user sees a batch that never completes
+ * and cannot publish it.
+ *
+ * This sweeps for exactly that: not-finished documents with no unfinished
+ * pages. It is cheap because the condition is rare, and it is the only thing
+ * that can rescue a document already in that state.
+ */
+export async function reconcileDocumentStatuses(limit = 50) {
+  const stranded = await prisma.document.findMany({
+    where: {
+      queueNamespace: config.queueNamespace,
+      ocrStatus: { in: ['PENDING', 'PROCESSING'] },
+      // Prepared, so page rows exist, and none of them are still outstanding.
+      preparedAt: { not: null },
+      pages: { none: { status: { in: ['PENDING', 'PROCESSING'] } } },
+    },
+    select: { id: true },
+    take: limit,
+  });
+  for (const document of stranded) await refreshDocumentStatus(document.id);
+  return stranded.length;
+}
+
 export async function pendingPageCount() {
   return prisma.ocrPage.count({
     where: {

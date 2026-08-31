@@ -20,26 +20,18 @@ export const highlightListSchema = z.object({
   highlights: z.array(highlightSchema).max(50000),
 });
 
+/**
+ * A workspace's documents, for status polling, search, and cancellation.
+ *
+ * The cap is a workspace size, not an upload size. Thirty is the most that can
+ * be *uploaded at once*, but files are added to a workspace that is already
+ * open, so the set being polled grows past thirty in normal use -- and the old
+ * limit rejected every status poll and every search the moment it did.
+ */
 export const documentIdsSchema = z.object({
-  ids: z.array(z.string().min(1)).min(1).max(30),
+  ids: z.array(z.string().min(1)).min(1).max(500),
 });
 
 export const documentSearchSchema = documentIdsSchema.extend({
   keywords: z.array(z.string().trim().min(1).max(250)).min(1).max(100),
-});
-
-export const findingSchema = z.object({
-  fileName: z.string().min(1).max(500),
-  pageNumber: z.number().int().positive(),
-  title: z.string().max(1000),
-  keyword: z.string().max(250),
-  matchedText: z.string().max(1000),
-  context: z.string().max(4000),
-  source: z.enum(['AUTO', 'MANUAL']),
-  note: z.string().max(1000),
-  confidence: z.number().min(0).max(100).nullable(),
-});
-
-export const findingsReportSchema = z.object({
-  findings: z.array(findingSchema).max(100000),
 });

@@ -179,7 +179,7 @@ class DaemonPool {
   private idle: number[] = [];
   private waiting: Array<(index: number) => void> = [];
 
-  constructor(private readonly size: number) {
+  constructor(size: number) {
     this.daemons = new Array(size).fill(undefined);
     this.idle = Array.from({ length: size }, (_value, index) => index);
   }

@@ -7,3 +7,9 @@ onnxruntime>=1.17,<2
 opencv-python-headless>=4.9
 pyclipper>=1.3
 PyYAML>=6.0
+
+# Wrapping an uploaded photo or scan in a single-page PDF, losslessly: img2pdf
+# embeds a JPEG as-is rather than re-encoding it, and Pillow is what it uses to
+# read anything that is not already JPEG.
+img2pdf>=0.5,<1
+Pillow>=10.0

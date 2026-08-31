@@ -24,6 +24,12 @@ export function normalizeToken(value: string) {
     .replace(/\p{M}/gu, '')
     .replace(/ı/g, 'i')
     .replace(/ə/g, '')
+    // Uzbek writes `oʻ` and `gʻ` with a modifier letter, U+02BB. Unicode counts
+    // it as a letter, so the letters-and-digits filter below keeps it -- while
+    // the recogniser, whose character set has no such glyph, emits a plain
+    // apostrophe or nothing at all. Dropping every modifier letter makes the
+    // typed and the recognised spelling agree.
+    .replace(/\p{Lm}/gu, '')
     .replace(/(^[^\p{L}\p{N}\p{Pd}]+|[^\p{L}\p{N}\p{Pd}]+$)/gu, '');
 }
 

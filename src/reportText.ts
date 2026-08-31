@@ -102,17 +102,6 @@ function repairLegacyAzeriFont(text: string) {
   return applyLegacyEncodings(text, detectLegacyEncodings(text));
 }
 
-/**
- * Decodes both legacy Azerbaijani font encodings into real Unicode. The
- * extraction path calls this before deciding whether a page needs OCR: these
- * PDFs carry a complete, correctly positioned text layer that only looks like
- * mojibake, and reading it is several hundred times cheaper than recognising a
- * rasterised copy of the same page.
- */
-export function repairLegacyEncodings(text: string) {
-  return repairLegacyAzeriFont(text);
-}
-
 /** True when either legacy font encoding is present. */
 export function hasLegacyEncoding(text: string) {
   const { bytes, cyrillic } = detectLegacyEncodings(text);
@@ -131,9 +120,3 @@ export function cleanReportText(value: string, maxLength = 4000) {
     .slice(0, maxLength);
 }
 
-/** Excel treats leading =, +, -, and @ as formulas. Preserve the visible
- * source text while forcing these values to remain plain text. */
-export function spreadsheetText(value: string, maxLength = 4000) {
-  const cleaned = cleanReportText(value, maxLength);
-  return /^[=+\-@]/.test(cleaned) ? `'${cleaned}` : cleaned;
-}

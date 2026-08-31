@@ -26,6 +26,11 @@ export type ExtractedPage = {
   textRepaired?: boolean;
   /** Share of the page's characters that were dropped as unreadable. */
   unreadableRatio?: number;
+  /**
+   * Share of words showing a mis-mapped subset font. Above a small threshold
+   * the text layer is fiction and the page has to be recognised instead.
+   */
+  brokenEncodingRatio?: number;
 };
 
 const clamp = (value: number) => Math.max(0, Math.min(1, value));
@@ -115,7 +120,7 @@ function repairPageWords(words: OcrWord[]) {
   };
 }
 
-function readPageWords(page: any, viewport: any, pageNumber: number, content: any) {
+function readPageWords(viewport: any, pageNumber: number, content: any) {
   const words: OcrWord[] = [];
 
   for (const [itemIndex, raw] of content.items.entries()) {
@@ -172,6 +177,42 @@ function readPageWords(page: any, viewport: any, pageNumber: number, content: an
 }
 
 /**
+ * Detects a text layer whose character map is wrong.
+ *
+ * Some publications embed subset fonts whose `ToUnicode` table is offset -- in
+ * the issues seen here, by exactly 29 code points, so `Respublikası` extracts as
+ * `5esSXblikası` and `Dixotomiya` as `'ixotomiya`. The glyphs *draw* correctly,
+ * so the page looks perfect to a reader while the text behind it is nonsense.
+ *
+ * That is worse than a page with no text at all, because it passes every other
+ * quality check and lands in the search index and the published `content` as
+ * plausible-looking rubbish. It cannot be repaired in place either: the same
+ * character range is used both correctly and incorrectly on the same page, so
+ * shifting it back would corrupt the text that was already right.
+ *
+ * Two signals, both chosen for precision over recall after measuring them
+ * across the sample corpus: an uppercase ASCII letter directly after a
+ * lowercase one, and a digit wedged inside a word. On these documents the
+ * affected pages score 3-4% while clean pages stay under 0.2%, so the threshold
+ * sits well clear of both. URLs and initials are excluded -- `www.adalet.az` and
+ * `A.R.Atamoğlanov` are ordinary text that would otherwise look broken.
+ */
+const URL_LIKE = /^(https?:|www\.)|\.(az|com|org|net|ru|tr)\b/i;
+const INITIALS = /^(\p{Lu}\.){1,3}\p{Lu}/u;
+const MIXED_CASE = /\p{Ll}[A-Z]/u;
+const DIGIT_IN_WORD = /\p{L}[0-9]\p{L}/u;
+
+export function brokenEncodingRatio(words: OcrWord[]) {
+  const tokens = words
+    .map((word) => word.text)
+    .filter((text) => text.length > 1 && !URL_LIKE.test(text) && !INITIALS.test(text));
+  // Too little text to judge; the usability checks handle those pages anyway.
+  if (tokens.length < 40) return 0;
+  const suspect = tokens.filter((token) => MIXED_CASE.test(token) || DIGIT_IN_WORD.test(token)).length;
+  return suspect / tokens.length;
+}
+
+/**
  * An open PDF that pages can be read from one at a time.
  *
  * The pipeline processes pages as independent jobs, so the document is parsed
@@ -198,10 +239,10 @@ export async function openPdf(filePath: string): Promise<PdfHandle> {
       try {
         const viewport = page.getViewport({ scale: 1 });
         if (!withText) {
-          return { pageNumber, width: viewport.width, height: viewport.height, text: '', words: [], textRepaired: false, unreadableRatio: 0 };
+          return { pageNumber, width: viewport.width, height: viewport.height, text: '', words: [], textRepaired: false, unreadableRatio: 0, brokenEncodingRatio: 0 };
         }
         const content = await page.getTextContent();
-        const { words, repaired, unreadableRatio } = readPageWords(page, viewport, pageNumber, content);
+        const { words, repaired, unreadableRatio } = readPageWords(viewport, pageNumber, content);
         return {
           pageNumber,
           width: viewport.width,
@@ -210,6 +251,7 @@ export async function openPdf(filePath: string): Promise<PdfHandle> {
           words,
           textRepaired: repaired,
           unreadableRatio,
+          brokenEncodingRatio: brokenEncodingRatio(words),
         };
       } finally {
         page.cleanup();
@@ -219,17 +261,4 @@ export async function openPdf(filePath: string): Promise<PdfHandle> {
       await loadingTask.destroy();
     },
   };
-}
-
-export async function extractPdfPages(filePath: string, options: ExtractOptions = {}): Promise<ExtractedPage[]> {
-  const pdf = await openPdf(filePath);
-  try {
-    const pages: ExtractedPage[] = [];
-    for (let pageNumber = 1; pageNumber <= pdf.pageCount; pageNumber += 1) {
-      pages.push(await pdf.readPage(pageNumber, options));
-    }
-    return pages;
-  } finally {
-    await pdf.close();
-  }
 }

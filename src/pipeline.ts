@@ -8,7 +8,7 @@ import { normalizeForSearch } from './normalize.js';
 import { openPdf, type ExtractedPage, type PdfHandle } from './pdfText.js';
 import { jpegDimensions, renderDpiForPage, renderPageImage } from './render.js';
 import { hasLegacyEncoding } from './reportText.js';
-import { storage } from './storage.js';
+import { MissingSourceFileError, storage } from './storage.js';
 import { completePage, failPage, refreshDocumentStatus, type ClaimedPage } from './pageQueue.js';
 import { compactWords } from './words.js';
 import type { OcrWord } from './types.js';
@@ -16,6 +16,57 @@ import type { OcrWord } from './types.js';
 const MIN_USABLE_CHARACTERS = 35;
 const MIN_USABLE_WORDS = 6;
 const PAGE_DB_CHUNK = 25;
+
+/** Above this share of suspect words, one page's text layer is not trustworthy. */
+const BROKEN_ENCODING_PAGE = 0.003;
+/**
+ * A broken font is a property of the document, not of one page. Once this share
+ * of pages is clearly affected, the rest are treated as suspect too -- their
+ * cleaner-looking text comes from the same font and is wrong in the same way,
+ * just with fewer words to give it away.
+ */
+const BROKEN_ENCODING_DOCUMENT = 0.25;
+
+/**
+ * Above this share of one-to-three character boxes, a text layer is not split
+ * into words.
+ *
+ * Some PDFs draw each syllable, or each glyph run, as its own text object with
+ * a space between: "azaldilmasi" is stored as "azal dil ma si". The letters are
+ * right, so nothing else here objects, but the word boundaries are fiction --
+ * and a keyword search has nothing else to go on. Searching "azal" then matches
+ * the first fragment of "azaldilmasi" exactly as if it were the whole word,
+ * because on this page it *is* a whole box.
+ *
+ * The geometry cannot settle it either: measured on an affected page, the gap
+ * inside a word ("azal" -> "dil", 0.53 of the text height) is the same as the
+ * gap between two words ("sial" -> "qrup", 0.65), because the box widths come
+ * from a subset font whose metrics are wrong. So the page is recognised from
+ * the raster instead, where the spacing that a reader sees is what gets read.
+ *
+ * Measured across this corpus: normal pages run 16-19% short boxes with a
+ * median length of 6, affected pages 95% with a median of 2. The threshold sits
+ * in the empty space between.
+ */
+const FRAGMENTED_WORDS_PAGE = 0.55;
+/** Below this many boxes a page is too short to judge; the document decides. */
+const FRAGMENTED_MIN_WORDS = 40;
+/** As with a broken font, fragmentation is a property of the whole PDF. */
+const FRAGMENTED_DOCUMENT = 0.25;
+
+/**
+ * The share of a page's boxes that are too short to be words.
+ *
+ * Returns undefined when there is too little text to be worth judging, so a
+ * caption-only page is not condemned by a handful of boxes.
+ */
+export function fragmentedWordRatio(words: { text: string }[]) {
+  const lengths = words
+    .map((word) => word.text.replace(/[^\p{L}\p{N}]/gu, '').length)
+    .filter((length) => length > 0);
+  if (lengths.length < FRAGMENTED_MIN_WORDS) return undefined;
+  return lengths.filter((length) => length <= 3).length / lengths.length;
+}
 
 /**
  * Decides whether a page's own text layer can be used instead of reading a
@@ -45,6 +96,15 @@ export function embeddedTextIsUsable(page: ExtractedPage) {
   // that decoding produced. Only text that was never recognised as an encoding
   // is checked, where tripping this test means genuine mojibake.
   if (!page.textRepaired && hasLegacyEncoding(compactText)) return false;
+  // A subset font with a broken character map: the page reads perfectly but its
+  // text layer is fiction, so it has to be recognised from the raster instead.
+  // Measured across the sample corpus, affected pages reach 0.3-3.8% while every
+  // clean page stays at or below 0.16%, so this sits with room on both sides.
+  if ((page.brokenEncodingRatio ?? 0) > BROKEN_ENCODING_PAGE) return false;
+  // A text layer split into syllables rather than words. The characters are
+  // fine, so this is the only test that catches it, and using such a page would
+  // silently return a keyword inside every longer word that starts with it.
+  if ((fragmentedWordRatio(page.words) ?? 0) > FRAGMENTED_WORDS_PAGE) return false;
   const mojibakeSequences = compactText.match(/(?:Ã.|Â.|Ä.|Å.)/g)?.length ?? 0;
   if (mojibakeSequences >= 2 && mojibakeSequences * 2 >= compactText.length * 0.08) return false;
   const validWords = page.words.filter((word) =>
@@ -107,6 +167,8 @@ export async function prepareDocument(documentId: string, signal: AbortSignal) {
     //
     // Chunking still costs one statement per twenty-five pages rather than one
     // per page, which is what matters over a pooled Neon connection.
+    const encodingRatios: number[] = [];
+    const fragmentRatios: number[] = [];
     let chunk: Prisma.OcrPageCreateManyInput[] = [];
     const flush = async () => {
       if (!chunk.length) return;
@@ -117,6 +179,9 @@ export async function prepareDocument(documentId: string, signal: AbortSignal) {
     for (let pageNumber = 1; pageNumber <= pdf.pageCount; pageNumber += 1) {
       if (signal.aborted) return;
       const page = await pdf.readPage(pageNumber, { withText: !forceOcr });
+      encodingRatios.push(page.brokenEncodingRatio ?? 0);
+      const fragmentRatio = fragmentedWordRatio(page.words);
+      if (fragmentRatio !== undefined) fragmentRatios.push(fragmentRatio);
       const usable = !forceOcr && embeddedTextIsUsable(page);
       if (usable) textPages += 1;
       else ocrPages += 1;
@@ -134,6 +199,57 @@ export async function prepareDocument(documentId: string, signal: AbortSignal) {
       if (chunk.length >= PAGE_DB_CHUNK) await flush();
     }
     await flush();
+
+    // A broken font is a property of the document, so once enough pages are
+    // clearly affected the pages that looked clean are re-read from the raster
+    // too. Their text came from the same font and is wrong in the same way --
+    // it simply held too few suspect words to cross the per-page threshold. The
+    // rewrite happens before preparedAt is set, so the queue only ever sees the
+    // final decision.
+    const affectedPages = encodingRatios.filter((ratio) => ratio > BROKEN_ENCODING_PAGE).length;
+    if (encodingRatios.length && affectedPages / encodingRatios.length >= BROKEN_ENCODING_DOCUMENT) {
+      // Only pages that show some sign of it. A page scoring exactly zero
+      // across a couple of thousand words is not a page that got lucky -- these
+      // documents mix fonts, and the pages that came out clean genuinely are.
+      // Re-reading them anyway was costing a sixth of every affected document
+      // in recognition time to correct text that was already correct.
+      const suspectPages = encodingRatios
+        .map((ratio, index) => (ratio > 0 ? index + 1 : 0))
+        .filter((pageNumber) => pageNumber > 0);
+      const { count } = await prisma.ocrPage.updateMany({
+        where: { documentId, source: 'pdf-text', pageNumber: { in: suspectPages } },
+        data: { status: 'PENDING', source: 'pending', text: '', searchText: '', words: [] },
+      });
+      if (count) {
+        textPages -= count;
+        ocrPages += count;
+        console.log(
+          `[ocr] document=${documentId} has a broken embedded font `
+          + `(${affectedPages}/${encodingRatios.length} pages); re-reading ${count} text pages by OCR`,
+        );
+      }
+    }
+
+    // Fragmented word boxes are a property of the PDF's producer, so once
+    // enough pages show it the short pages that could not be judged on their
+    // own are re-read too, rather than being left as the only pages in the
+    // document whose keyword matches cannot be trusted.
+    const fragmentedPages = fragmentRatios.filter((ratio) => ratio > FRAGMENTED_WORDS_PAGE).length;
+    if (fragmentRatios.length && fragmentedPages / fragmentRatios.length >= FRAGMENTED_DOCUMENT) {
+      const { count } = await prisma.ocrPage.updateMany({
+        where: { documentId, source: 'pdf-text' },
+        data: { status: 'PENDING', source: 'pending', text: '', searchText: '', words: [] },
+      });
+      if (count) {
+        textPages -= count;
+        ocrPages += count;
+        console.log(
+          `[ocr] document=${documentId} stores syllables rather than words `
+          + `(${fragmentedPages}/${fragmentRatios.length} pages); re-reading ${count} text pages by OCR`,
+        );
+      }
+    }
+
     // This is the commit point for preparation. The claim query ignores every
     // page row until this is set, so a deploy midway through chunked inserts
     // can never make a truncated document look complete.
@@ -334,7 +450,11 @@ export async function processPage(page: ClaimedPage, signal: AbortSignal) {
 
 export async function handlePageFailure(page: ClaimedPage, error: unknown) {
   const message = error instanceof Error ? error.message : 'Unknown page failure';
-  const exhausted = await failPage(page.id, page.attempts, message);
+  // A missing upload will still be missing on the next attempt, so the page is
+  // retired immediately rather than working through its retries to reach the
+  // same answer three times more slowly.
+  const permanent = error instanceof MissingSourceFileError;
+  const exhausted = await failPage(page.id, permanent ? config.maxPageAttempts : page.attempts, message);
   await refreshDocumentStatus(page.documentId);
   return { exhausted, message };
 }

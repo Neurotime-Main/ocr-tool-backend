@@ -165,7 +165,21 @@ def crop_box(image, box):
 
 
 class AngleClassifier:
-    """Detects text rotated by 180 degrees and flips it before recognition."""
+    """Points out crops that may be rotated by 180 degrees.
+
+    It suggests rather than decides, because on its own it is not reliable
+    enough to act on. Measured on a broadsheet page it wanted to flip 5 of 441
+    crops and was wrong about 3 of them, turning a legible sentence into
+    gibberish; on an Azerbaijani post image it was wrong about 4 of 7. It says
+    so with near-certainty in those cases -- scores of 0.94 to 1.00 -- so no
+    threshold separates its mistakes from its successes.
+
+    What does separate them is asking the recogniser, which is a far larger
+    model and reads the wrong way up badly. So this returns the indices it is
+    suspicious of and `Engine.read` reads those crops both ways round, keeping
+    whichever the recogniser is surer of. Only flagged crops pay for the second
+    pass -- about one percent of a newspaper page.
+    """
 
     SHAPE = (3, 48, 192)
 
@@ -175,6 +189,7 @@ class AngleClassifier:
 
     def __call__(self, crops):
         channels, height, width = self.SHAPE
+        suspected = set()
         for index, crop in enumerate(crops):
             scaled_w = min(width, max(1, int(height * crop.shape[1] / max(crop.shape[0], 1))))
             tensor = np.zeros((1, channels, height, width), np.float32)
@@ -182,8 +197,8 @@ class AngleClassifier:
             tensor[0, :, :, :scaled_w] = ((resized - 0.5) / 0.5).transpose(2, 0, 1)
             scores = self.session.run(None, {self.input_name: tensor})[0][0]
             if scores[1] > 0.9:
-                crops[index] = np.ascontiguousarray(np.rot90(crop, 2))
-        return crops
+                suspected.add(index)
+        return suspected
 
 
 class Recognizer:
@@ -259,18 +274,28 @@ class Engine:
                 keep.append(box)
         if not crops:
             return []
-        if self.classifier is not None:
-            crops = self.classifier(crops)
+        upside_down = self.classifier(crops) if self.classifier is not None else set()
 
         recognizers = [self.recognizer(script) for script in scripts if script in ("latin", "cyrillic")]
         if not recognizers:
             recognizers = [self.recognizer("latin")]
-        lines = []
-        for box, crop in zip(keep, crops):
+
+        def read_crop(crop):
             # A page can contain both Latin and Russian text. Each selected
             # script reads the same crop and the stronger recognition score is
             # retained, while Azerbaijani and English share one Latin pass.
-            text, score = max((recognizer(crop) for recognizer in recognizers), key=lambda result: result[1])
+            return max((recognizer(crop) for recognizer in recognizers), key=lambda result: result[1])
+
+        lines = []
+        for index, (box, crop) in enumerate(zip(keep, crops)):
+            text, score = read_crop(crop)
+            if index in upside_down:
+                # The classifier thinks this one is upside down. Read it that
+                # way too and believe whichever reading the recogniser is
+                # surer of, rather than the classifier.
+                rotated_text, rotated_score = read_crop(np.ascontiguousarray(np.rot90(crop, 2)))
+                if rotated_score > score:
+                    text, score = rotated_text, rotated_score
             if not text or score < REC_MIN_SCORE:
                 continue
             left = float(np.min(box[:, 0]))

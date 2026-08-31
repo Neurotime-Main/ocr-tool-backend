@@ -14,7 +14,8 @@ import { config, describeRuntime, isSpacesDriver } from './config.js';
 import { prisma } from './db.js';
 import { checkOcrEngine } from './ocrEngine.js';
 import { checkRenderer } from './render.js';
-import { storage } from './storage.js';
+import { checkConverter, checkImageConverter } from './convert.js';
+import { mediaStorageIsPublic, storage, uploadsAreDurable } from './storage.js';
 import { getQueueHealth } from './pageQueue.js';
 
 // `warn` is for things that are wrong for production but perfectly normal on a
@@ -53,16 +54,39 @@ add(`Storage (${storageStatus.driver})`, storageStatus.ok, storageStatus.detail,
   storageStatus.ok ? undefined
     : 'Check DO_SPACES_KEY, DO_SPACES_SECRET, DO_SPACES_BUCKET and DO_SPACES_ENDPOINT.');
 
-if (!isSpacesDriver(config.storageDriver)) {
-  add('Storage durability', inProduction ? 'fail' : 'warn', `STORAGE_DRIVER=${config.storageDriver}`,
-    'Fine for local development. In production set STORAGE_DRIVER=spaces: a Render disk is erased on every deploy, taking uploaded PDFs with it.');
+// Uploads living on the container's disk is the intended arrangement, not a
+// misconfiguration -- but the consequence is worth stating plainly.
+if (!uploadsAreDurable()) {
+  add('Uploaded PDFs', 'warn', `kept on this container's disk (${config.storageDir})`,
+    'A deploy or restart clears them and any document still being worked on must be re-uploaded. '
+    + 'Recognised text and published images are unaffected. Set STORAGE_DRIVER=spaces to keep uploads in the bucket.');
 }
+add('Published images', mediaStorageIsPublic() ? 'ok' : 'fail',
+  mediaStorageIsPublic() ? `${config.spaces.bucket}/${config.mediaImages.prefix}` : 'no bucket configured',
+  mediaStorageIsPublic() ? undefined
+    : 'Publishing has nowhere to put page images. Set DO_SPACES_BUCKET and the other DO_SPACES_* variables.');
 
 // --- Rasteriser -----------------------------------------------------------
 const renderer = await checkRenderer();
 add('PDF renderer (Poppler)', renderer.ok, renderer.detail,
   renderer.ok ? undefined
     : 'Install it: `sudo apt-get install -y poppler-utils` (macOS: `brew install poppler`). The Docker image installs it already.');
+
+// --- Office conversion ----------------------------------------------------
+// Only a warning: PDFs still work without it, and plenty of deployments never
+// see a Word file.
+const converter = await checkConverter();
+add('Office to PDF (LibreOffice)', converter.ok ? 'ok' : 'warn', converter.detail,
+  converter.ok ? undefined
+    : 'Install it with `sudo apt-get install -y libreoffice-writer-nogui` to accept .doc/.docx/.xlsx/.pptx uploads. PDFs are unaffected.');
+
+// --- Image conversion -----------------------------------------------------
+// Also only a warning, for the same reason: it is needed to accept photos and
+// scans, not to process a PDF.
+const imageConverter = await checkImageConverter();
+add('Image to PDF (img2pdf)', imageConverter.ok ? 'ok' : 'warn', imageConverter.detail,
+  imageConverter.ok ? undefined
+    : 'Run `npm run setup:python` to accept .jpg/.png/.heic uploads. PDFs are unaffected.');
 
 // --- Recognition models ---------------------------------------------------
 const models = ['det.onnx', 'cls.onnx', 'rec_latin.onnx', 'rec_latin.yml', 'rec_cyrillic.onnx', 'rec_cyrillic.yml'];
@@ -79,6 +103,38 @@ const engine = await checkOcrEngine();
 add('PaddleOCR engine', engine.ok, engine.detail,
   engine.ok ? undefined
     : `Create the Python runtime: \`python3 -m venv .venv && .venv/bin/pip install -r python/requirements.txt\`, then set PYTHON_BIN to its python. Currently PYTHON_BIN=${config.pythonBin}.`);
+
+// --- Published image URLs -------------------------------------------------
+// Publishing writes an image and records its address. Whether that address is
+// actually reachable is invisible from inside the process, so it is proved the
+// only way that means anything: store a probe, fetch it over plain HTTP the way
+// a reader's browser would, then remove it.
+if (isSpacesDriver(config.storageDriver)) {
+  const probeKey = `${config.mediaImages.prefix}/.public-access-probe.txt`;
+  try {
+    await storage.savePublicObject(probeKey, Buffer.from('probe\n'), 'text/plain');
+    const url = storage.publicUrl(probeKey);
+    const origin = new URL(url).origin;
+    try {
+      const response = await fetch(url, { redirect: 'follow' });
+      add('Published image URLs', response.ok ? 'ok' : 'fail',
+        `${origin} -> HTTP ${response.status}`,
+        response.ok ? undefined
+          : 'Published images will not open. Either make this host serve the Space, or clear '
+            + 'MEDIA_IMAGE_BASE_URL so the Space\'s own origin is used.');
+    } catch (error) {
+      add('Published image URLs', 'fail', `${origin} -> ${(error as Error).message}`,
+        config.mediaImages.baseUrl
+          ? `MEDIA_IMAGE_BASE_URL is set to ${config.mediaImages.baseUrl}, which does not serve the Space. `
+            + 'Clear it to use the Space origin, or point that host at the bucket.'
+          : 'The Space origin did not respond. Check the bucket name and endpoint.');
+    }
+    await storage.delete(probeKey).catch(() => undefined);
+  } catch (error) {
+    add('Published image URLs', 'fail', (error as Error).message.split('\n')[0] ?? 'probe upload failed',
+      'The service could not write a public object. Check the Spaces key has write access.');
+  }
+}
 
 // --- Queue ----------------------------------------------------------------
 try {

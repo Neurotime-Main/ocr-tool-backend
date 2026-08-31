@@ -12,9 +12,16 @@ FROM node:22-bookworm-slim AS runtime
 # poppler-utils rasterises pages; python3 runs the recognition daemon. No OCR
 # engine is installed system-wide: recognition is PaddleOCR PP-OCRv5 on ONNX
 # Runtime, which reads these documents both faster and far more accurately.
+#
+# LibreOffice converts Word/Excel/PowerPoint uploads to PDF at the door, so
+# every later stage deals only in PDF pages. The -nogui packages bring the
+# import filters without a desktop stack, and the fonts keep a converted
+# document laid out the way its author saw it.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates curl poppler-utils python3 python3-venv libgomp1 \
+        libreoffice-writer-nogui libreoffice-calc-nogui libreoffice-impress-nogui \
+        fonts-dejavu-core fonts-liberation2 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

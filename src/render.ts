@@ -41,18 +41,28 @@ export function renderDpiForPage(page: Pick<ExtractedPage, 'width' | 'height'>) 
  * these files but the recogniser, which downsamples them anyway, so lossless
  * output bought nothing.
  */
+export type RenderOptions = {
+  /**
+   * Grayscale by default: it is smaller and the recogniser ignores colour.
+   * Published images keep it, because those are looked at rather than read by
+   * a model.
+   */
+  grayscale?: boolean;
+};
+
 export async function renderPageImage(
   pdfPath: string,
   pageNumber: number,
   outputBase: string,
   dpi: number,
   signal: AbortSignal,
+  options: RenderOptions = {},
 ) {
   try {
     await execFileAsync('pdftoppm', [
       '-f', String(pageNumber), '-l', String(pageNumber), '-singlefile',
       '-r', String(dpi),
-      '-gray',
+      ...((options.grayscale ?? true) ? ['-gray'] : []),
       '-jpeg', '-jpegopt', `quality=${config.renderJpegQuality}`,
       pdfPath, outputBase,
     ], { maxBuffer: 8 * 1024 * 1024, signal, timeout: config.renderTimeoutMs });
