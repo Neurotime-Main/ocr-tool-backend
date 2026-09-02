@@ -120,6 +120,44 @@ function repairPageWords(words: OcrWord[]) {
   };
 }
 
+/**
+ * Roughly how wide a character is, relative to the others around it.
+ *
+ * A PDF text item gives one width for the whole run, so a run holding several
+ * words has to be divided up to place each of them. Dividing by character count
+ * treats `i` and `W` as equals, and on this corpus 85% of words come from such
+ * runs -- so the error is not a corner case, it is most of the page. It also
+ * accumulates left to right, which is why a highlight tended to sit to the left
+ * of the word it belonged to.
+ *
+ * These are approximate advance widths for a proportional face, not the
+ * document's real metrics -- pdf.js does not expose those through
+ * `getTextContent`. Being approximately right about every character beats being
+ * exactly wrong about all of them.
+ */
+const NARROW_CHARACTERS = new Set([...`ijlI.,;:!|'\`ı()[]{}/\\-`]);
+const WIDE_CHARACTERS = new Set([...'mwMW@%']);
+
+function characterWidth(character: string) {
+  if (character === ' ') return 0.26;
+  if (NARROW_CHARACTERS.has(character)) return 0.30;
+  if (WIDE_CHARACTERS.has(character)) return 0.88;
+  if (character >= '0' && character <= '9') return 0.55;
+  if (/\p{Lu}/u.test(character)) return 0.68;
+  return 0.52;
+}
+
+/** Cumulative width up to each index, so a slice of the run can be measured. */
+function widthPrefix(text: string) {
+  // Indexed by UTF-16 unit, matching what `matchAll` reports, so a surrogate
+  // pair is charged as two halves rather than shifting every later position.
+  const prefix = new Float64Array(text.length + 1);
+  for (let index = 0; index < text.length; index += 1) {
+    prefix[index + 1] = prefix[index]! + characterWidth(text[index]!);
+  }
+  return prefix;
+}
+
 function readPageWords(viewport: any, pageNumber: number, content: any) {
   const words: OcrWord[] = [];
 
@@ -128,6 +166,8 @@ function readPageWords(viewport: any, pageNumber: number, content: any) {
     const item = raw as PdfTextItem;
     const tokenMatches = [...item.str.matchAll(/\S+/g)];
     if (!tokenMatches.length) continue;
+    const prefix = widthPrefix(item.str);
+    const totalWidth = prefix[item.str.length] || 1;
     const baseX = item.transform[4] ?? 0;
     const baseY = item.transform[5] ?? 0;
     const angle = Math.atan2(item.transform[1] ?? 0, item.transform[0] ?? 1);
@@ -138,8 +178,8 @@ function readPageWords(viewport: any, pageNumber: number, content: any) {
 
     tokenMatches.forEach((match, tokenIndex) => {
       const token = match[0];
-      const startRatio = (match.index ?? 0) / Math.max(item.str.length, 1);
-      const endRatio = ((match.index ?? 0) + token.length) / Math.max(item.str.length, 1);
+      const startRatio = prefix[match.index ?? 0]! / totalWidth;
+      const endRatio = prefix[(match.index ?? 0) + token.length]! / totalWidth;
       const start = itemWidth * startRatio;
       const end = itemWidth * endRatio;
       const pdfCorners = [
@@ -202,6 +242,18 @@ const INITIALS = /^(\p{Lu}\.){1,3}\p{Lu}/u;
 const MIXED_CASE = /\p{Ll}[A-Z]/u;
 const DIGIT_IN_WORD = /\p{L}[0-9]\p{L}/u;
 
+/**
+ * Both signals fire on ordinary words too -- `YouTube`, `iPhone`, `BakiBus` and
+ * any quoted brand name are indistinguishable from `5esSXblikasi` to a rule
+ * this cheap. Tightening the pattern does not separate them: requiring a
+ * lowercase letter after the capital drops `YouTube` but also drops
+ * `5esSXblikasi` and `3UH]iGHQWiQ`, which are exactly the cases worth catching.
+ *
+ * So a couple of matches is treated as noise rather than evidence. A page with
+ * a genuinely mis-mapped font produces them in double figures.
+ */
+const MIN_SUSPECT_TOKENS = 3;
+
 export function brokenEncodingRatio(words: OcrWord[]) {
   const tokens = words
     .map((word) => word.text)
@@ -209,6 +261,7 @@ export function brokenEncodingRatio(words: OcrWord[]) {
   // Too little text to judge; the usability checks handle those pages anyway.
   if (tokens.length < 40) return 0;
   const suspect = tokens.filter((token) => MIXED_CASE.test(token) || DIGIT_IN_WORD.test(token)).length;
+  if (suspect < MIN_SUSPECT_TOKENS) return 0;
   return suspect / tokens.length;
 }
 

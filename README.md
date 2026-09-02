@@ -4,8 +4,8 @@ Standalone Node.js/Express backend for batch OCR processing, highlight persisten
 
 ## Production architecture
 
-- **Render:** one Docker web service. It serves HTTP and reads the OCR queue in the same process. (Recognition can be split into its own worker later — see "Scaling up" — but that is not the default.)
-- **Neon:** PostgreSQL through Prisma. It also holds the work queue.
+- **Render:** one Docker web service, and it has to be one. It serves HTTP and reads the OCR queue in the same process, because the queue *is* that process's memory.
+- **No database.** Uploads, pages and highlights are held in memory and are gone when the service restarts. A batch has to be published in the run it was uploaded in.
 - **DigitalOcean Spaces (`ams3`):** private storage for uploaded source PDFs, reached through the S3 SDK. Render's filesystem holds only temporary page images.
 - **PaddleOCR PP-OCRv5** on ONNX Runtime, in a Python daemon beside the worker. The models ship inside the image, so no page ever leaves the container.
 
@@ -13,12 +13,12 @@ The batch API accepts up to 30 PDFs per request. Source files are persisted to S
 
 ## How a document is processed
 
-Pages, not documents, are the unit of work, and the queue is a table in Postgres rather than an array in the API process. That gives four things the previous design could not:
+Pages, not documents, are the unit of work, and the queue is a set of objects in the API process's memory.
 
-1. **Results appear as they are read.** Every finished page is written immediately, so a batch is searchable while the rest of it is still running. Nothing waits for the slowest PDF.
+1. **Results appear as they are read.** Every finished page is stored immediately, so a batch is searchable while the rest of it is still running. Nothing waits for the slowest PDF.
 2. **A bad page costs a page.** Each page gets three attempts; one that keeps failing is marked `FAILED` and the rest of its document completes without it. `ocrError` then says how many pages were lost and which one failed first.
-3. **A deploy loses nothing.** Workers claim pages with `FOR UPDATE SKIP LOCKED` and hand them back on shutdown. A page whose worker vanished is returned to the queue when its lock expires (`OCR_STALE_LOCK_MS`).
-4. **Workers scale sideways.** Any number of instances can share the queue with no coordination.
+3. **A restart loses the workspace.** There is nowhere else the queue exists, so a deploy discards uploads that were not published. This is the price of having no database; deploy between batches.
+4. **Recognition scales with CPU, not instances.** A second instance would hold its own empty workspace, so `OCR_CONCURRENCY` and the container's cores are the only levers.
 
 The pipeline for each page:
 
@@ -57,7 +57,7 @@ Recognition is CPU bound and each page uses one core, so **pages in parallel is 
 | `OCR_MAX_PAGE_PIXELS` | `12000000` | Ceiling on one rendered page; oversized page boxes render below `OCR_RENDER_DPI`. |
 | `OCR_MAX_PAGE_ATTEMPTS` | `3` | Attempts before a page is given up on. |
 | `OCR_STALE_LOCK_MS` | `600000` | How long a claimed page may be silent before another worker may take it. |
-| `RUN_OCR_IN_API` | `true` | Runs the worker inside the API process. Leave it on for the one-service deployment in `render.yaml`; set it to false only after creating a separate worker. |
+| `OCR_MAX_RETAINED_DOCUMENTS` | `200` | How many documents stay in memory before the oldest finished ones are dropped, taking their stored PDFs with them. This is what bounds the heap. |
 
 The upload form accepts Azerbaijani, English, and Russian independently. English and Azerbaijani use the shared Latin recognizer; Russian uses PaddleOCR's Cyrillic PP-OCRv5 recognizer. When Latin and Russian are both selected, each detected line is tested with both relevant recognizers and the higher-confidence result is kept, so mixed-script pages take longer than one-script pages.
 
@@ -82,11 +82,9 @@ The recogniser runs as a **persistent daemon** rather than a process per page: l
 
 ## Search
 
-Keyword search filters candidate pages in the database before loading anything. Each page stores `searchText`: its text put through the same normaliser the matcher uses, with spaces removed, indexed with a `pg_trgm` GIN index. A page that cannot contain a keyword is ruled out in Postgres rather than having its word boxes shipped to the API to find that out.
+Keyword search rules pages out before touching their word boxes. Each page stores `searchText`: its text put through the same normaliser the matcher uses, with spaces removed. A page whose `searchText` holds none of the keywords cannot produce a match, so its word boxes are never walked.
 
 Matching then runs on a line's letters with the spaces taken out. These documents are typeset in justified columns that break words across syllables — `şəbəkələrdən` is set as `şə bə kə lər dən` — and PDF text layers routinely split one word into several glyph runs. A word-by-word comparison misses those; requiring the match to begin at a word start and end at a word end keeps it from over-matching. Highlight rectangles are the union of the boxes the match actually covers, so the output shape is unchanged.
-
-Pages written before `searchText` existed carry an empty value and are always treated as candidates. The worker backfills them in batches whenever the queue is idle, after which the index does its job for them too.
 
 ## Cancelling a batch
 
@@ -127,9 +125,7 @@ megabytes less per process, so more pages fit on a small container.
 
 ```bash
 cd backend
-cp .env.example .env          # then fill in DATABASE_URL / DIRECT_URL
 npm install
-npm run prisma:migrate
 
 npm run setup:python          # venv + dependencies + models, one command
 #   prints the PYTHON_BIN line to paste into .env
@@ -152,15 +148,12 @@ the queue, and prints the exact command that fixes whatever is broken.
    is only 1 CPU / 2 GB and processes one page at a time; Pro is 2 CPU / 4 GB
    and processes two. Free is 0.1 CPU and is unsuitable for OCR.
 3. Set the environment variables below.
-4. Deploy. The container runs `prisma migrate deploy` before starting, so the
-   schema is applied for you.
+4. Deploy. There is no migration step: the container starts the server directly.
 5. Open `/api/health`. It should report `"ok": true` and `"queue": {"stalled":
    false}`. If it does not, the response names the failing dependency.
 
 | Variable | Value | Required |
 | --- | --- | --- |
-| `DATABASE_URL` | Neon **pooled** string (host contains `-pooler`), `?sslmode=require` | yes |
-| `DIRECT_URL` | Neon **direct** string, used by migrations | yes |
 | `CLIENT_ORIGIN` | your Vercel origin, comma-separated for several | yes |
 | `STORAGE_DRIVER` | `spaces` | yes |
 | `DO_SPACES_BUCKET` | the Space name alone, no URL | yes |
@@ -172,7 +165,7 @@ the queue, and prints the exact command that fixes whatever is broken.
 | `DO_SPACES_DISABLE_CHECKSUMS` | `true` — Spaces rejects the SDK's chunked framing | no |
 | `MAX_BATCH_FILES` / `MAX_UPLOAD_MB` | `30` / `50` | no |
 | `OCR_CONCURRENCY` | pages at once; defaults to whole cgroup CPU quota, memory-capped | no |
-| `OCR_QUEUE_NAMESPACE` | `production` on Render, `development` locally; prevents workers sharing a database from claiming each other's files | no |
+| `OCR_QUEUE_NAMESPACE` | `production` on Render, `development` locally; now only a label in the boot line | no |
 | `PPOCR_DET_MAX_SIDE` | `1600`; lower to `1280` for ~⅓ faster, less small text | no |
 | `NODE_ENV` | set by the Dockerfile | no |
 
@@ -184,34 +177,24 @@ The process refuses to start without it rather than losing uploads later.
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| Documents stay `PENDING` forever | Nothing is reading the queue | `/api/health` → `queue.lastClaimSeconds: null`. Usually `RUN_OCR_IN_API=false` with no worker service. Unset it. |
+| Documents stay `PENDING` forever | Nothing is reading the queue | `/api/health` → `queue.lastClaimSeconds: null`. Check the log for a preparation or worker crash. |
 | Every page: *the stored PDF is missing* | `STORAGE_DRIVER` is not `spaces` | Set it and the `DO_SPACES_*` variables. Re-upload — the old files are gone. |
 | *The OCR engine could not be started* | No Python, or `PYTHON_BIN` points nowhere | Locally `npm run setup:python`. On Render this means the service is not the Docker image. |
 | *The PDF page renderer is not installed* | No Poppler | Same cause as above: not built from the Dockerfile. |
 | Health check fails on deploy | A dependency is down | The `/api/health` body names which one. |
 | Batch is slow, CPU pinned | Too few cores | `/api/health` reports the actual `runtime.cpuQuota`. Free is 0.1 CPU, Standard is 1, and Pro is 2. Use Pro for production batches, or lower `PPOCR_DET_MAX_SIDE` to `1280`. |
-| Deploy killed a running batch | Normal | In-flight pages return to the queue and resume. Nothing is lost. |
+| Deploy killed a running batch | Expected | The workspace is memory. Upload the batch again. |
 
 ### Scaling up
 
-Recognition can move to its own service once OCR volume justifies it: same
-image, `dockerCommand: node dist/worker.js`, **every environment variable
-copied across**, and `RUN_OCR_IN_API=false` on the web service. The worker
-refuses to start if its storage or engine is misconfigured rather than failing
-page by page.
+Recognition cannot move to its own service: that service would hold an empty
+workspace and never find a page to read, so `dist/worker.js` refuses to start.
+Give this service more CPU and raise `OCR_CONCURRENCY` instead.
 
-Do this only when API latency actually suffers during batches. Two services is
-two sets of variables to keep in step, and every production failure this project
-has had came from them drifting apart.
-
-## Neon setup
-
-Create a Neon project and copy both connection strings from its connection dialog:
-
-- `DATABASE_URL`: the pooled hostname containing `-pooler`, used by the running API.
-- `DIRECT_URL`: the non-pooled hostname, used by Prisma migrations.
-
-Both URLs should include `sslmode=require`. The Docker startup command runs `prisma migrate deploy` before starting the API.
+Note the shape of the trade. Page-level parallelism is not free: measured on a
+12-thread / 6-core host, two pages at three threads each read eight pages in 88s
+where six pages at one thread each took 196s. Keep `OCR_CONCURRENCY` x
+`PPOCR_THREADS` near the physical core count.
 
 ## Object storage setup
 
@@ -263,6 +246,4 @@ Preview deployments get a new hostname per branch, which is why `CLIENT_ORIGIN` 
 | `npm run doctor` | Checks every dependency and names the fix for anything broken |
 | `npm run setup:python` | Creates the Python runtime and downloads the models |
 | `npm run build` / `npm start` | Compile / run the compiled server |
-| `npm run prisma:migrate` | Apply migrations locally |
-| `npm run prisma:deploy` | Apply migrations in production (the container does this on boot) |
-| `npm run start:worker` | Standalone OCR worker, for the split deployment only |
+| `npm run write-env` | Regenerate `.env.example` from the current settings |

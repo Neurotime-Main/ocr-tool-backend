@@ -1,7 +1,6 @@
 FROM node:22-bookworm-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
-COPY prisma ./prisma
 RUN npm ci
 COPY tsconfig.json ./
 COPY src ./src
@@ -37,7 +36,6 @@ RUN python3 -m venv $VIRTUAL_ENV \
     && $VIRTUAL_ENV/bin/pip install --no-cache-dir -r python/requirements.txt
 
 COPY package.json package-lock.json ./
-COPY prisma ./prisma
 RUN npm ci --omit=dev
 
 COPY python ./python
@@ -58,4 +56,5 @@ import onnxruntime as ort, os; d=os.environ['PPOCR_MODEL_DIR']; \
 print('PaddleOCR models load correctly')"
 
 EXPOSE 4000
-CMD ["sh", "-c", "npx prisma migrate deploy && node dist/server.js"]
+# No migrations to run: the workspace is this process's memory.
+CMD ["node", "dist/server.js"]

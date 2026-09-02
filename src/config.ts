@@ -75,11 +75,6 @@ export function ocrScriptsForLanguage(value: string): OcrScript[] {
  */
 export function assertRuntimeEnvironment() {
   const missing: string[] = [];
-  if (!process.env.DATABASE_URL) {
-    throw new Error(
-      'DATABASE_URL is missing. Create backend/.env from backend/.env.example and set your Neon pooled connection string.',
-    );
-  }
   if (isSpacesDriver(process.env.STORAGE_DRIVER) || process.env.DO_SPACES_BUCKET) {
     if (!process.env.DO_SPACES_BUCKET) missing.push('DO_SPACES_BUCKET');
     if (!process.env.DO_SPACES_ENDPOINT) missing.push('DO_SPACES_ENDPOINT');
@@ -256,7 +251,13 @@ const memoryBoundConcurrency = Math.max(1, Math.floor(usableMemory / WORKER_MEMO
  * every page reporting a missing file. One service that works beats two that
  * might. Set RUN_OCR_IN_API=false on the API once a dedicated worker exists.
  */
-const runWorkerInProcess = (process.env.RUN_OCR_IN_API ?? 'true') !== 'false';
+/**
+ * Always true now, and kept as a field only so the boot line and health report
+ * still say so. The queue lives in this process's memory, so a worker anywhere
+ * else would have nothing to read; RUN_OCR_IN_API=false would simply stop every
+ * upload from ever being processed.
+ */
+const runWorkerInProcess = true;
 
 /**
  * How many pages are recognised at once.
@@ -420,6 +421,21 @@ export const config = {
   // batch instead of once per page.
   pageClaimSize: positiveInteger(process.env.OCR_PAGE_CLAIM_SIZE, Math.max(4, ocrConcurrency * 2), 64),
   maxPageAttempts: positiveInteger(process.env.OCR_MAX_PAGE_ATTEMPTS, 3, 10),
+  /**
+   * How many documents the in-memory workspace keeps before dropping the oldest.
+   *
+   * The workspace has no database behind it, so this is what bounds the heap.
+   * Word boxes dominate: a broadsheet page carries a few thousand of them, and
+   * only pages read from the PDF's own text layer keep theirs -- a recognised
+   * page stores its words too, but a document that needed OCR has fewer usable
+   * pages to begin with. Measured on this corpus, a twelve-page issue costs a
+   * few megabytes, so the default leaves a couple of hundred issues live in a
+   * container sized for the recognisers.
+   *
+   * Only finished documents are dropped, so a busy workspace can exceed this
+   * rather than throw away work in progress.
+   */
+  maxRetainedDocuments: positiveInteger(process.env.OCR_MAX_RETAINED_DOCUMENTS, 200, 5000),
   queuePollIntervalMs: positiveInteger(process.env.OCR_POLL_INTERVAL_MS, 2_000),
   // Documents opened per preparation pass. Preparation is cheap and resolves
   // most pages outright, so this is deliberately larger than it looks: the

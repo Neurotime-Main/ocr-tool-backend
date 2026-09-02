@@ -9,6 +9,14 @@ export type RecognizedLine = {
   confidence: number;
   /** [x, y, width, height], normalised to the page. */
   box: [number, number, number, number];
+  /**
+   * Where each character of `text` sits across the line box, as a fraction of
+   * its width, taken from the timestep the recogniser emitted it at.
+   *
+   * Absent only if the daemon could not supply it, in which case the caller
+   * falls back to spacing words evenly -- which is what this replaced.
+   */
+  charOffsets?: number[];
 };
 
 export class OcrEngineError extends Error {}
@@ -277,14 +285,50 @@ export async function shutdownOcrEngine() {
  * the slice of the line its characters occupy -- accurate enough to highlight,
  * and identical in shape to what the PDF text path produces.
  */
+/**
+ * Turns a recognised line into one box per word.
+ *
+ * The line box covers the whole strip the detector found, so each word's share
+ * of it has to be worked out. `charOffsets` gives the centre of every
+ * character, so a word's edges are the midpoints between its own outermost
+ * characters and their neighbours -- the gap between two words is split evenly
+ * between them, which is where a reader would put the boundary too.
+ *
+ * Dividing the strip by character count instead, as this did before, assumes
+ * every letter is the same width. It is not: on a line beginning with wide
+ * capitals every following word is estimated too far left, which is exactly the
+ * drift that showed up as highlights sitting beside their word rather than on
+ * it.
+ */
 export function lineToWords(line: RecognizedLine, pageNumber: number, lineIndex: number): OcrWord[] {
   const [lineX, lineY, lineWidth, lineHeight] = line.box;
   const tokens = [...line.text.matchAll(/\S+/g)];
   if (!tokens.length) return [];
+
+  const centres = line.charOffsets?.length === line.text.length ? line.charOffsets : undefined;
   const totalCharacters = Math.max(line.text.length, 1);
+
+  const edges = (first: number, last: number) => {
+    if (!centres) {
+      // No positions from the recogniser: fall back to even spacing.
+      return [first / totalCharacters, (last + 1) / totalCharacters] as const;
+    }
+    const before = first > 0 ? centres[first - 1]! : undefined;
+    const after = last + 1 < centres.length ? centres[last + 1]! : undefined;
+    const head = centres[first]!;
+    const tail = centres[last]!;
+    // At the ends of the line there is no neighbour to split the gap with, so
+    // the word is extended by half its own average character width instead.
+    const ownHalf = Math.max((tail - head) / Math.max(last - first, 1), 0) / 2;
+    return [
+      before === undefined ? Math.max(0, head - ownHalf) : (before + head) / 2,
+      after === undefined ? Math.min(1, tail + ownHalf) : (tail + after) / 2,
+    ] as const;
+  };
+
   return tokens.map((token, tokenIndex) => {
-    const start = (token.index ?? 0) / totalCharacters;
-    const end = ((token.index ?? 0) + token[0].length) / totalCharacters;
+    const first = token.index ?? 0;
+    const [start, end] = edges(first, first + token[0].length - 1);
     return {
       id: `p${pageNumber}-ocr-${lineIndex}-${tokenIndex}`,
       text: token[0],

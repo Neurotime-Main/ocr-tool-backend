@@ -1,22 +1,27 @@
 import { randomUUID } from 'node:crypto';
-import { Prisma } from '@prisma/client';
 import { config } from './config.js';
-import { compactWords, needsCompaction } from './words.js';
-import { prisma } from './db.js';
+import {
+  allDocuments, allPages, getDocument, getPage, pagesOf, updateDocument, updatePage,
+  type DocumentRow, type PageRow,
+} from './store.js';
+import type { OcrWord } from './types.js';
 
 /**
- * The work queue, kept in Postgres rather than in the API process's memory.
+ * The work queue, held in this process's memory.
  *
- * The previous queue was an array inside the web service: it could not be
- * shared with a second process, it competed with HTTP traffic for the CPU, and
- * a deploy dropped whatever was in flight. Claiming rows with
- * `FOR UPDATE SKIP LOCKED` gives the same ordering guarantees with none of
- * that -- any number of workers can pull from it, a crashed worker's pages are
- * recovered by their lock expiring, and the queue survives a restart because it
- * is simply the set of pages that are not finished yet.
+ * It used to live in Postgres, claimed with `FOR UPDATE SKIP LOCKED`, so that
+ * several worker processes could share it and a deploy could not drop what was
+ * in flight. Neither applies now: there is one process, and its memory is the
+ * only copy. What the queue still owes its callers is unchanged -- pages come
+ * out in upload order, a page is handed to exactly one runner at a time, and a
+ * page that keeps failing runs out of attempts instead of looping forever.
+ *
+ * Claiming needs no lock. `claimPages` runs start to finish without awaiting,
+ * and JavaScript will not interleave another turn inside it, so two concurrent
+ * callers cannot see the same page as PENDING.
  */
 
-export const WORKER_ID = `${config.queueNamespace}-${process.env.RENDER_INSTANCE_ID ?? 'local'}-${process.pid}-${randomUUID().slice(0, 8)}`;
+export const WORKER_ID = `${config.queueNamespace}-${process.pid}-${randomUUID().slice(0, 8)}`;
 
 export type ClaimedPage = {
   id: string;
@@ -28,192 +33,166 @@ export type ClaimedPage = {
   ocrMode: string;
 };
 
+const claimable = (document: DocumentRow, page: PageRow) =>
+  page.status === 'PENDING'
+  && page.attempts < config.maxPageAttempts
+  && document.preparedAt !== null;
+
 /**
- * Takes up to `limit` pending pages for this worker.
+ * Takes up to `limit` pending pages.
  *
- * Ordering by document age and then page number means a batch is worked
- * through roughly in upload order, and it keeps the pages one worker holds
- * clustered in a few documents -- so the PDF each page belongs to is downloaded
- * and parsed once for the whole run instead of once per page.
- *
- * `SKIP LOCKED` is what makes several workers safe: two workers racing for the
- * same row do not block each other, the second simply takes the next one.
+ * Order is upload order and then page number, which keeps the pages of one
+ * batch clustered in a few documents -- so the PDF each page belongs to is
+ * opened once for the whole run rather than once per page.
  */
 export async function claimPages(limit: number): Promise<ClaimedPage[]> {
-  return prisma.$queryRaw<ClaimedPage[]>`
-    WITH claimed AS (
-      SELECT p.id
-      FROM "OcrPage" p
-      JOIN "Document" d ON d.id = p."documentId"
-      WHERE p.status = 'PENDING'
-        AND p.attempts < ${config.maxPageAttempts}
-        AND d."queueNamespace" = ${config.queueNamespace}
-        AND d."preparedAt" IS NOT NULL
-      ORDER BY d."createdAt" ASC, p."pageNumber" ASC
-      FOR UPDATE OF p SKIP LOCKED
-      LIMIT ${limit}
-    )
-    UPDATE "OcrPage" p
-    SET status = 'PROCESSING',
-        attempts = p.attempts + 1,
-        "lockedBy" = ${WORKER_ID},
-        "startedAt" = NOW(),
-        "updatedAt" = NOW()
-    FROM claimed, "Document" d2
-    WHERE p.id = claimed.id AND d2.id = p."documentId"
-    RETURNING p.id, p."documentId", p."pageNumber", p.attempts,
-              d2."storageKey", d2."ocrLanguage", d2."ocrMode"
-  `;
+  const claimed: ClaimedPage[] = [];
+  const now = new Date();
+  for (const { document, page } of allPages()) {
+    if (claimed.length >= limit) break;
+    if (!claimable(document, page)) continue;
+    page.status = 'PROCESSING';
+    page.attempts += 1;
+    page.lockedBy = WORKER_ID;
+    page.startedAt = now;
+    page.updatedAt = now;
+    claimed.push({
+      id: page.id,
+      documentId: document.id,
+      pageNumber: page.pageNumber,
+      attempts: page.attempts,
+      storageKey: document.storageKey,
+      ocrLanguage: document.ocrLanguage,
+      ocrMode: document.ocrMode,
+    });
+  }
+  return claimed;
 }
 
 /**
- * Returns pages whose worker disappeared to the queue.
+ * Returns pages whose runner never settled them.
  *
- * A page is only ever left in PROCESSING by a worker that stopped between
- * claiming it and finishing it -- a deploy, an OOM kill, a lost instance. The
- * attempt has already been counted, so a page that keeps killing its worker
- * still runs out of retries rather than looping forever.
+ * With one process this is a narrower case than it was: a page is only left in
+ * PROCESSING by a code path that threw somewhere the page handler does not
+ * cover. The attempt has already been counted, so a page that keeps doing this
+ * still runs out of retries rather than cycling.
  */
 export async function releaseStalePages() {
-  const cutoff = new Date(Date.now() - config.staleLockMs);
-
-  // A page abandoned on its final attempt must be retired, not offered again.
-  // Returning it to PENDING with its attempts already spent would put it in a
-  // state the claim query filters out, so nothing would ever pick it up and its
-  // document would report PROCESSING forever. A worker being killed part-way
-  // through its last attempt is routine -- it is what every deploy does -- so
-  // this is the difference between a batch that finishes and one that never
-  // does.
-  const retired = await prisma.ocrPage.updateMany({
-    where: {
-      status: 'PROCESSING',
-      document: { queueNamespace: config.queueNamespace },
-      startedAt: { lt: cutoff },
-      attempts: { gte: config.maxPageAttempts },
-    },
-    data: {
-      status: 'FAILED',
-      error: 'The worker reading this page stopped before it finished, and no attempts were left.',
-      lockedBy: null,
-      startedAt: null,
-    },
-  });
-
-  const returned = await prisma.ocrPage.updateMany({
-    where: {
-      status: 'PROCESSING',
-      document: { queueNamespace: config.queueNamespace },
-      startedAt: { lt: cutoff },
-    },
-    data: { status: 'PENDING', lockedBy: null, startedAt: null },
-  });
-
-  // Rows already stranded by an earlier release, before the rule above existed.
-  const rescued = await prisma.ocrPage.updateMany({
-    where: {
-      status: 'PENDING',
-      document: { queueNamespace: config.queueNamespace },
-      attempts: { gte: config.maxPageAttempts },
-    },
-    data: {
-      status: 'FAILED',
-      error: 'This page ran out of attempts while a worker was being restarted.',
-      lockedBy: null,
-      startedAt: null,
-    },
-  });
-
-  return retired.count + returned.count + rescued.count;
+  const cutoff = Date.now() - config.staleLockMs;
+  let recovered = 0;
+  for (const { page } of allPages()) {
+    const stale = page.status === 'PROCESSING'
+      && page.startedAt !== null
+      && page.startedAt.getTime() < cutoff;
+    // A page abandoned on its final attempt must be retired, not offered again:
+    // returned to PENDING with its attempts spent, it would be invisible to the
+    // claim query and its document would report PROCESSING forever.
+    if (stale && page.attempts >= config.maxPageAttempts) {
+      updatePage(page.id, {
+        status: 'FAILED',
+        error: 'The reader for this page stopped before it finished, and no attempts were left.',
+        lockedBy: null,
+        startedAt: null,
+      });
+      recovered += 1;
+      continue;
+    }
+    if (stale) {
+      updatePage(page.id, { status: 'PENDING', lockedBy: null, startedAt: null });
+      recovered += 1;
+      continue;
+    }
+    if (page.status === 'PENDING' && page.attempts >= config.maxPageAttempts) {
+      updatePage(page.id, {
+        status: 'FAILED',
+        error: 'This page ran out of attempts.',
+        lockedBy: null,
+        startedAt: null,
+      });
+      recovered += 1;
+    }
+  }
+  return recovered;
 }
 
 /**
  * Finishes documents whose pages have all settled.
  *
- * A document's status is refreshed by whichever worker finished its last page.
- * If that worker died in between -- a deploy, an OOM kill, a lost connection --
- * nothing ever looks at the document again and it reports PROCESSING for good,
- * even though every page is done. The user sees a batch that never completes
- * and cannot publish it.
- *
- * This sweeps for exactly that: not-finished documents with no unfinished
- * pages. It is cheap because the condition is rare, and it is the only thing
- * that can rescue a document already in that state.
+ * A document's status is refreshed by whoever finished its last page. If that
+ * path threw in between, nothing looks at the document again and it reports
+ * PROCESSING for good, even though every page is done -- a batch that never
+ * completes and cannot be published. This sweeps for exactly that.
  */
 export async function reconcileDocumentStatuses(limit = 50) {
-  const stranded = await prisma.document.findMany({
-    where: {
-      queueNamespace: config.queueNamespace,
-      ocrStatus: { in: ['PENDING', 'PROCESSING'] },
-      // Prepared, so page rows exist, and none of them are still outstanding.
-      preparedAt: { not: null },
-      pages: { none: { status: { in: ['PENDING', 'PROCESSING'] } } },
-    },
-    select: { id: true },
-    take: limit,
-  });
-  for (const document of stranded) await refreshDocumentStatus(document.id);
+  const stranded: string[] = [];
+  for (const document of documentsNeedingStatus()) {
+    if (stranded.length >= limit) break;
+    stranded.push(document.id);
+  }
+  for (const id of stranded) await refreshDocumentStatus(id);
   return stranded.length;
 }
 
+function* documentsNeedingStatus() {
+  const seen = new Set<string>();
+  for (const { document } of allPages()) {
+    if (seen.has(document.id)) continue;
+    seen.add(document.id);
+    if (document.ocrStatus !== 'PENDING' && document.ocrStatus !== 'PROCESSING') continue;
+    if (document.preparedAt === null) continue;
+    const outstanding = pagesOf(document.id)
+      .some((page) => page.status === 'PENDING' || page.status === 'PROCESSING');
+    if (!outstanding) yield document;
+  }
+}
+
 export async function pendingPageCount() {
-  return prisma.ocrPage.count({
-    where: {
-      status: { in: ['PENDING', 'PROCESSING'] },
-      document: { queueNamespace: config.queueNamespace },
-    },
-  });
+  let count = 0;
+  for (const { page } of allPages()) {
+    if (page.status === 'PENDING' || page.status === 'PROCESSING') count += 1;
+  }
+  return count;
 }
 
 /**
  * Recomputes a document's status from its pages.
  *
- * The document row is a summary of the page rows, never a separate source of
- * truth, so this is safe to call from any worker at any time.
+ * The document is a summary of its pages, never a separate source of truth, so
+ * this is safe to call at any point.
  *
  * A document is COMPLETE once no page is still waiting, even when some pages
- * failed: the pages that were read are worth searching and exporting, and the
+ * failed: the pages that were read are worth searching and publishing, and the
  * failures are reported in `ocrError` rather than by discarding the rest. Only
  * a document where nothing at all could be read is FAILED.
  */
 export async function refreshDocumentStatus(documentId: string) {
-  const counts = await prisma.ocrPage.groupBy({
-    by: ['status'],
-    where: { documentId },
-    _count: { _all: true },
-  });
-  const total = counts.reduce((sum, row) => sum + row._count._all, 0);
+  const pages = pagesOf(documentId);
+  const total = pages.length;
   if (!total) return;
-  const by = (status: string) => counts.find((row) => row.status === status)?._count._all ?? 0;
+  const by = (status: string) => pages.filter((page) => page.status === status).length;
   const outstanding = by('PENDING') + by('PROCESSING');
   const failed = by('FAILED');
   const complete = by('COMPLETE');
 
   if (outstanding > 0) {
-    await prisma.document.updateMany({
-      where: { id: documentId, ocrStatus: { not: 'PROCESSING' } },
-      data: { ocrStatus: 'PROCESSING' },
-    });
+    const document = getDocument(documentId);
+    if (document && document.ocrStatus !== 'PROCESSING') {
+      updateDocument(documentId, { ocrStatus: 'PROCESSING' });
+    }
     return;
   }
 
-  const firstFailure = failed
-    ? await prisma.ocrPage.findFirst({
-      where: { documentId, status: 'FAILED' },
-      select: { pageNumber: true, error: true },
-      orderBy: { pageNumber: 'asc' },
-    })
-    : null;
+  const firstFailure = pages
+    .filter((page) => page.status === 'FAILED')
+    .sort((a, b) => a.pageNumber - b.pageNumber)[0];
 
-  await prisma.document.update({
-    where: { id: documentId },
-    data: {
-      ocrStatus: complete > 0 ? 'COMPLETE' : 'FAILED',
-      pageCount: total,
-      ocrError: failed
-        ? `${failed} of ${total} page${total === 1 ? '' : 's'} could not be read (first was page ${firstFailure?.pageNumber ?? '?'}: ${firstFailure?.error ?? 'unknown error'}).`.slice(0, 1000)
-        : null,
-    },
-  }).catch(() => undefined);
+  updateDocument(documentId, {
+    ocrStatus: complete > 0 ? 'COMPLETE' : 'FAILED',
+    pageCount: total,
+    ocrError: failed
+      ? `${failed} of ${total} page${total === 1 ? '' : 's'} could not be read (first was page ${firstFailure?.pageNumber ?? '?'}: ${firstFailure?.error ?? 'unknown error'}).`.slice(0, 1000)
+      : null,
+  });
 }
 
 /** Marks a claimed page finished. */
@@ -223,87 +202,47 @@ export async function completePage(pageId: string, data: {
   source: string;
   text: string;
   searchText: string;
-  words: Prisma.InputJsonValue;
+  words: OcrWord[];
 }) {
-  // `updateMany` rather than `update`: a user can cancel a document while one
-  // of its pages is being read, which deletes the row. That is a normal
-  // outcome, not an error worth failing the worker pass over.
-  await prisma.ocrPage.updateMany({
-    where: { id: pageId },
-    data: { ...data, status: 'COMPLETE', error: null, lockedBy: null, startedAt: null },
-  });
+  updatePage(pageId, { ...data, status: 'COMPLETE', error: null, lockedBy: null, startedAt: null });
 }
 
 /**
  * Records a failed attempt.
  *
  * The page goes back to PENDING while it has retries left, so a transient
- * failure -- a stalled download, a daemon that died mid-page -- costs one page
- * rather than the document. Once the attempts are spent it stays FAILED and the
- * rest of the document carries on without it.
+ * failure -- a daemon that died mid-page -- costs one page rather than the
+ * document. Once the attempts are spent it stays FAILED and the rest of the
+ * document carries on without it.
  */
 export async function failPage(pageId: string, attempts: number, message: string) {
   const exhausted = attempts >= config.maxPageAttempts;
-  await prisma.ocrPage.updateMany({
-    where: { id: pageId },
-    data: {
-      status: exhausted ? 'FAILED' : 'PENDING',
-      error: message.slice(0, 1000),
-      lockedBy: null,
-      startedAt: null,
-    },
+  updatePage(pageId, {
+    status: exhausted ? 'FAILED' : 'PENDING',
+    error: message.slice(0, 1000),
+    lockedBy: null,
+    startedAt: null,
   });
   return exhausted;
 }
 
-/** Puts pages back without spending an attempt, for a clean worker shutdown. */
+/** Puts pages back without spending an attempt, for a clean shutdown. */
 export async function releasePages(pageIds: string[]) {
-  if (!pageIds.length) return;
-  await prisma.ocrPage.updateMany({
-    where: { id: { in: pageIds }, status: 'PROCESSING' },
-    data: { status: 'PENDING', lockedBy: null, startedAt: null, attempts: { decrement: 1 } },
-  });
+  for (const pageId of pageIds) {
+    const page = getPageIfProcessing(pageId);
+    if (!page) continue;
+    updatePage(pageId, {
+      status: 'PENDING',
+      lockedBy: null,
+      startedAt: null,
+      attempts: Math.max(0, page.attempts - 1),
+    });
+  }
 }
 
-/**
- * Brings pages written by the previous pipeline up to date.
- *
- * Two things need fixing on those rows, and both are cheapest to do together
- * while the queue is idle:
- *
- *  - `searchText` is empty, so the keyword filter cannot rule those pages out
- *    and has to load them in full. The value has to come from the same
- *    normaliser the matcher uses, which lives in TypeScript rather than SQL,
- *    which is why this is not a migration.
- *  - `words` is stored in the original uncompacted shape, at roughly twice the
- *    bytes. Transferring word boxes is what a search over many matching pages
- *    actually spends its time on, so halving them is the single most effective
- *    thing that can be done to it.
- */
-export async function backfillPages(normalize: (value: string) => string, batchSize = 100) {
-  // An empty `searchText` on a page that has text identifies exactly the rows
-  // the previous pipeline wrote, because the column and the compact word shape
-  // were introduced together. A genuinely blank page is excluded by `text`.
-  const pending = await prisma.ocrPage.findMany({
-    where: {
-      searchText: '',
-      NOT: { text: '' },
-      document: { queueNamespace: config.queueNamespace },
-    },
-    select: { id: true, text: true, words: true },
-    take: batchSize,
-  });
-  if (!pending.length) return 0;
-  await prisma.$transaction(pending.map((page) => prisma.ocrPage.update({
-    where: { id: page.id },
-    data: {
-      searchText: normalize(page.text),
-      ...(needsCompaction(page.words)
-        ? { words: compactWords(page.words) as unknown as Prisma.InputJsonValue }
-        : {}),
-    },
-  })));
-  return pending.length;
+function getPageIfProcessing(pageId: string) {
+  const page = getPage(pageId);
+  return page?.status === 'PROCESSING' ? page : undefined;
 }
 
 export type QueueHealth = {
@@ -319,53 +258,46 @@ export type QueueHealth = {
 /**
  * Reports whether anything is actually draining the queue.
  *
- * Recognition runs in its own service, so the API can be perfectly healthy
- * while no worker exists at all -- and the only symptom is that documents stay
- * PENDING forever, with nothing anywhere saying why. There is no heartbeat
- * table, but `startedAt` is written every time a page is claimed, so the most
- * recent claim stands in for "a worker is alive". Work waiting while nothing
- * has been claimed for minutes is the signature of a worker that is missing,
- * crash-looping, or pointed at the wrong database.
+ * There is no heartbeat, but `startedAt` is written every time a page is
+ * claimed, so the most recent claim stands in for "the worker is alive". Work
+ * waiting while nothing has been claimed for minutes is the signature of a
+ * worker loop that has stopped.
  */
 export async function getQueueHealth(): Promise<QueueHealth> {
-  const unpreparedWhere: Prisma.DocumentWhereInput = {
-    queueNamespace: config.queueNamespace,
-    ocrStatus: { in: ['PENDING', 'PROCESSING'] },
-    preparedAt: null,
-  };
-  const [unpreparedDocuments, pendingPages, processingPages, oldest, lastClaim, oldestUnprepared] = await Promise.all([
-    prisma.document.count({ where: unpreparedWhere }),
-    prisma.ocrPage.count({
-      where: { status: 'PENDING', document: { queueNamespace: config.queueNamespace } },
-    }),
-    prisma.ocrPage.count({
-      where: { status: 'PROCESSING', document: { queueNamespace: config.queueNamespace } },
-    }),
-    prisma.ocrPage.findFirst({
-      where: { status: 'PENDING', document: { queueNamespace: config.queueNamespace } },
-      select: { createdAt: true },
-      orderBy: { createdAt: 'asc' },
-    }),
-    prisma.ocrPage.findFirst({
-      where: {
-        startedAt: { not: null },
-        document: { queueNamespace: config.queueNamespace },
-      },
-      select: { startedAt: true },
-      orderBy: { startedAt: 'desc' },
-    }),
-    prisma.document.findFirst({
-      where: unpreparedWhere,
-      select: { createdAt: true },
-      orderBy: { createdAt: 'asc' },
-    }),
-  ]);
+  let unpreparedDocuments = 0;
+  let pendingPages = 0;
+  let processingPages = 0;
+  let oldestUnprepared: number | null = null;
+  let oldestPending: number | null = null;
+  let lastClaim: number | null = null;
 
-  const secondsSince = (date: Date | null | undefined) =>
-    date ? Math.round((Date.now() - date.getTime()) / 1000) : null;
-  const oldestUnpreparedSeconds = secondsSince(oldestUnprepared?.createdAt);
-  const oldestPendingSeconds = secondsSince(oldest?.createdAt);
-  const lastClaimSeconds = secondsSince(lastClaim?.startedAt);
+  for (const document of allDocuments()) {
+    const unprepared = document.preparedAt === null
+      && (document.ocrStatus === 'PENDING' || document.ocrStatus === 'PROCESSING');
+    if (unprepared) {
+      unpreparedDocuments += 1;
+      const at = document.createdAt.getTime();
+      if (oldestUnprepared === null || at < oldestUnprepared) oldestUnprepared = at;
+    }
+    for (const page of pagesOf(document.id)) {
+      if (page.status === 'PENDING') {
+        pendingPages += 1;
+        const at = page.createdAt.getTime();
+        if (oldestPending === null || at < oldestPending) oldestPending = at;
+      }
+      if (page.status === 'PROCESSING') processingPages += 1;
+      if (page.startedAt) {
+        const at = page.startedAt.getTime();
+        if (lastClaim === null || at > lastClaim) lastClaim = at;
+      }
+    }
+  }
+
+  const secondsSince = (at: number | null) =>
+    at === null ? null : Math.round((Date.now() - at) / 1000);
+  const oldestUnpreparedSeconds = secondsSince(oldestUnprepared);
+  const oldestPendingSeconds = secondsSince(oldestPending);
+  const lastClaimSeconds = secondsSince(lastClaim);
 
   return {
     unpreparedDocuments,

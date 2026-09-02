@@ -227,14 +227,30 @@ class Recognizer:
         indices = logits.argmax(1)
         confidences = logits.max(1)
 
-        characters, scores, previous = [], [], -1
+        # The timestep a character is emitted at is also where it sits across the
+        # crop: the model reads left to right, one column of features per step.
+        # Keeping it costs nothing here and is the only honest source of a
+        # word's horizontal position -- the caller used to divide the line box
+        # by character count instead, which assumes every letter is as wide as
+        # every other and puts a highlight left of the word it belongs to.
+        steps = max(len(indices), 1)
+        characters, scores, offsets, previous = [], [], [], -1
         for position, index in enumerate(indices):
             if index != 0 and index != previous and index < len(self.charset):
                 characters.append(self.charset[index])
                 scores.append(confidences[position])
+                # Centre of the timestep, as a fraction of the crop's width.
+                offsets.append((position + 0.5) / steps)
             previous = index
-        text = "".join(characters).strip()
-        return text, float(np.mean(scores)) if scores else 0.0
+
+        # `strip()` may drop leading or trailing blanks, and the offsets have to
+        # follow the characters they belong to or every position after the cut
+        # is off by one character.
+        text = "".join(characters)
+        lead = len(text) - len(text.lstrip())
+        stripped = text.strip()
+        offsets = offsets[lead:lead + len(stripped)]
+        return stripped, float(np.mean(scores)) if scores else 0.0, offsets
 
 
 class Engine:
@@ -288,14 +304,17 @@ class Engine:
 
         lines = []
         for index, (box, crop) in enumerate(zip(keep, crops)):
-            text, score = read_crop(crop)
+            text, score, offsets = read_crop(crop)
             if index in upside_down:
                 # The classifier thinks this one is upside down. Read it that
                 # way too and believe whichever reading the recogniser is
                 # surer of, rather than the classifier.
-                rotated_text, rotated_score = read_crop(np.ascontiguousarray(np.rot90(crop, 2)))
-                if rotated_score > score:
-                    text, score = rotated_text, rotated_score
+                rotated = read_crop(np.ascontiguousarray(np.rot90(crop, 2)))
+                if rotated[1] > score:
+                    text, score = rotated[0], rotated[1]
+                    # The crop was turned around, so a character found at 0.2 of
+                    # the rotated strip sits at 0.8 of the one on the page.
+                    offsets = [1.0 - offset for offset in rotated[2]]
             if not text or score < REC_MIN_SCORE:
                 continue
             left = float(np.min(box[:, 0]))
@@ -307,6 +326,9 @@ class Engine:
                 "confidence": round(score * 100, 2),
                 # Normalised to the page so the caller never needs the raster.
                 "box": [left / width, top / height, (right - left) / width, (bottom - top) / height],
+                # One entry per character of `text`, each the character's centre
+                # as a fraction of the line box's width.
+                "charOffsets": [round(offset, 4) for offset in offsets],
             })
         # Reading order: top to bottom, then left to right.
         lines.sort(key=lambda line: (round(line["box"][1], 3), line["box"][0]))

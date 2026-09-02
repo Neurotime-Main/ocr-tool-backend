@@ -1,13 +1,13 @@
-# One Docker service does everything: HTTP and OCR.
+# One Docker service does everything: HTTP and OCR, and it has to.
 #
-# Splitting recognition into its own worker is the right shape once OCR volume
-# justifies it, and the code still supports it (`node dist/worker.js`, with
-# RUN_OCR_IN_API=false here). It is not the default because a second service is
-# a second set of environment variables to keep in step -- same database, same
-# Spaces credentials, same image -- and getting any of them wrong fails
-# silently: documents queue forever, or every page reports a missing file.
+# Uploads, the page queue and recognised pages live in the API process's own
+# memory, so recognition cannot be split into a second service: that service
+# would hold an empty workspace and never find a page to read. `dist/worker.js`
+# refuses to start for the same reason. Scale recognition with this service's
+# CPU and OCR_CONCURRENCY instead.
 #
-# See the "Scaling up" section of README.md before adding the worker.
+# The other consequence: a redeploy empties the workspace. Anything uploaded but
+# not yet published has to be uploaded again, so deploy between batches.
 
 services:
   - type: web
@@ -35,15 +35,6 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
-
-      # --- Neon -------------------------------------------------------------
-      # DATABASE_URL: the POOLED connection string (host contains "-pooler").
-      # DIRECT_URL:   the direct connection string, used by prisma migrate.
-      # Both need ?sslmode=require.
-      - key: DATABASE_URL
-        sync: false
-      - key: DIRECT_URL
-        sync: false
 
       # --- Vercel -----------------------------------------------------------
       # Comma-separated origins, no trailing slash. Include the preview pattern
@@ -95,7 +86,7 @@ services:
       # OCR_RENDER_DPI       rasterisation DPI (default 200)
       # PPOCR_DET_MAX_SIDE   detector input size; 1600 reads dense body copy,
       #                      1280 is ~a third faster and loses the smallest text
-      - key: RUN_OCR_IN_API
-        value: true
+      # OCR_MAX_RETAINED_DOCUMENTS  how many documents stay in memory before
+      #                      the oldest finished ones are dropped (default 200)
       - key: OCR_QUEUE_NAMESPACE
         value: production

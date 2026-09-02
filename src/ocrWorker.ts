@@ -1,14 +1,14 @@
 import { mkdir } from 'node:fs/promises';
-import { config, describeRuntime, isSpacesDriver } from './config.js';
-import { prisma } from './db.js';
+import { assertRuntimeEnvironment, config, describeRuntime, isSpacesDriver } from './config.js';
+
+assertRuntimeEnvironment();
 import { checkOcrEngine, shutdownOcrEngine } from './ocrEngine.js';
 import { checkRenderer } from './render.js';
 import {
-  backfillPages, claimPages, reconcileDocumentStatuses, refreshDocumentStatus, releasePages,
-  releaseStalePages,
+  claimPages, reconcileDocumentStatuses, refreshDocumentStatus, releasePages, releaseStalePages,
   type ClaimedPage,
 } from './pageQueue.js';
-import { normalizeForSearch } from './normalize.js';
+import { allDocuments, updateDocument } from './store.js';
 import { documentCache, handlePageFailure, prepareDocument, processPage } from './pipeline.js';
 import { storage } from './storage.js';
 
@@ -44,40 +44,22 @@ const state: WorkerState = {
  * usable.
  */
 async function prepareNewDocuments(signal: AbortSignal) {
-  const staleBefore = new Date(Date.now() - config.prepareStaleMs);
-  const pending = await prisma.document.findMany({
-    where: {
-      queueNamespace: config.queueNamespace,
-      preparedAt: null,
-      OR: [
-        { ocrStatus: 'PENDING' },
-        // A deploy or OOM kill can stop after PROCESSING is written but before
-        // the first page row. Recover that otherwise-permanent stranded state.
-        { ocrStatus: 'PROCESSING', updatedAt: { lt: staleBefore } },
-      ],
-    },
-    select: { id: true },
-    orderBy: { createdAt: 'asc' },
-    take: config.prepareBatchSize,
-  });
+  const staleBefore = Date.now() - config.prepareStaleMs;
+  const pending = allDocuments()
+    .filter((document) => document.preparedAt === null && (
+      document.ocrStatus === 'PENDING'
+      // A preparation that threw somewhere unguarded leaves PROCESSING written
+      // with no pages behind it. Recover that otherwise-permanent state.
+      || (document.ocrStatus === 'PROCESSING' && document.updatedAt.getTime() < staleBefore)
+    ))
+    .slice(0, config.prepareBatchSize);
+
   let claimed = 0;
   for (const document of pending) {
     if (signal.aborted) return 0;
-    // Several workers can see the same candidate. Only the one whose guarded
-    // update succeeds owns this preparation attempt.
-    const ownership = await prisma.document.updateMany({
-      where: {
-        id: document.id,
-        queueNamespace: config.queueNamespace,
-        preparedAt: null,
-        OR: [
-          { ocrStatus: 'PENDING' },
-          { ocrStatus: 'PROCESSING', updatedAt: { lt: staleBefore } },
-        ],
-      },
-      data: { ocrStatus: 'PROCESSING', ocrError: null },
-    });
-    if (!ownership.count) continue;
+    // Marking it before preparing keeps the loop from picking the same document
+    // up again on its next pass while this one is still reading it.
+    updateDocument(document.id, { ocrStatus: 'PROCESSING', ocrError: null });
     claimed += 1;
     await prepareDocument(document.id, signal);
   }
@@ -170,9 +152,9 @@ async function recognitionLoop(signal: AbortSignal) {
 }
 
 /**
- * Housekeeping: recovering pages from workers that vanished, and upgrading rows
- * the previous pipeline wrote. Both are slow-moving and neither may hold up the
- * two loops above, so they get their own.
+ * Housekeeping: recovering pages whose runner never settled them, and closing
+ * documents whose pages are all done. Both are slow-moving and neither may hold
+ * up the two loops above, so they get their own.
  */
 async function maintenanceLoop(signal: AbortSignal) {
   while (state.running && !signal.aborted) {
@@ -183,11 +165,6 @@ async function maintenanceLoop(signal: AbortSignal) {
       // had its status refreshed, and would otherwise stay PROCESSING forever.
       const reconciled = await reconcileDocumentStatuses();
       if (reconciled) console.log(`[ocr] finished ${reconciled} document(s) whose pages were already done`);
-      const upgraded = await backfillPages(normalizeForSearch);
-      if (upgraded) {
-        console.log(`[ocr] upgraded ${upgraded} stored page(s)`);
-        continue;
-      }
     } catch (error) {
       console.error('[ocr] maintenance pass failed:', error);
     }
@@ -277,7 +254,6 @@ export async function runWorkerService() {
   const shutdown = async () => {
     console.log('[ocr] shutting down');
     await stopOcrWorker();
-    await prisma.$disconnect();
     process.exit(0);
   };
   process.on('SIGINT', shutdown);

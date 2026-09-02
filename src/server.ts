@@ -4,9 +4,18 @@ import multer from 'multer';
 import path from 'node:path';
 import { mkdir, rm, stat, unlink } from 'node:fs/promises';
 import {
-  config, describeRuntime, OCR_LANGUAGE_CODES, parseOcrLanguages, serializeOcrLanguages, type OcrLanguageCode,
+  assertRuntimeEnvironment, config, describeRuntime, OCR_LANGUAGE_CODES, parseOcrLanguages,
+  serializeOcrLanguages, type OcrLanguageCode,
 } from './config.js';
-import { prisma } from './db.js';
+
+// Used to run as a side effect of opening the database connection. With no
+// database to open, the check has to be made explicitly -- and still at import
+// time, so a misconfigured service fails at boot rather than on first upload.
+assertRuntimeEnvironment();
+import {
+  createDocument, deleteDocuments, evictOverflow, getDocument, getDocuments, highlightsOf,
+  pagesOf, replaceAllHighlights, storeStats,
+} from './store.js';
 import { storage } from './storage.js';
 import { checkOcrEngine } from './ocrEngine.js';
 import { checkRenderer } from './render.js';
@@ -33,7 +42,7 @@ if (config.runWorkerInProcess) startOcrWorker();
 else {
   console.log(
     '[boot] OCR runs in the separate markwise-ocr-worker service. If documents stay PENDING, that '
-    + 'service is missing, crash-looping, or pointed at a different DATABASE_URL. GET /api/health '
+    + 'worker loop has stopped or is crash-looping. GET /api/health '
     + 'reports the queue state.',
   );
 }
@@ -107,16 +116,18 @@ async function storeUpload(file: Express.Multer.File, options: {
   try {
     const storageKey = await storage.saveTemporaryFile(sourcePath);
     const { size } = converted ? await stat(converted).catch(() => ({ size: file.size })) : file;
-    const document = await prisma.document.create({
-      data: {
-        originalName: pdfNameFor(file.originalname),
-        storageKey,
-        size,
-        ocrLanguage: serializeOcrLanguages(options.languages),
-        ocrMode: options.ocrMode,
-        queueNamespace: config.queueNamespace,
-      },
+    const document = createDocument({
+      originalName: pdfNameFor(file.originalname),
+      storageKey,
+      size,
+      ocrLanguage: serializeOcrLanguages(options.languages),
+      ocrMode: options.ocrMode,
     });
+    // The workspace is memory, so it has to be bounded. Anything dropped here
+    // is a finished document well past the retention cap; its PDF goes with it.
+    for (const evicted of evictOverflow()) {
+      await storage.delete(evicted.storageKey).catch(() => undefined);
+    }
     return { document, storageKey };
   } finally {
     // `saveTemporaryFile` consumes the file it is given; the other one, and the
@@ -125,11 +136,6 @@ async function storeUpload(file: Express.Multer.File, options: {
     await unlink(file.path).catch(() => undefined);
   }
 }
-
-const documentInclude = {
-  pages: { orderBy: { pageNumber: 'asc' as const } },
-  highlights: { orderBy: { createdAt: 'asc' as const } },
-};
 
 async function mapWithConcurrency<T, Result>(
   items: T[],
@@ -150,23 +156,18 @@ async function mapWithConcurrency<T, Result>(
 }
 
 /**
- * Stops any OCR work for these documents and removes every trace of them:
- * database rows and the stored PDF. Cancelling waits for the running job to
+ * Stops any OCR work for these documents and removes every trace of them: the
+ * workspace entry and the stored PDF. Cancelling waits for the running job to
  * settle first, so a job can never write pages back after the rollback.
  */
 async function discardDocuments(ids: string[]) {
-  const documents = await prisma.document.findMany({
-    where: { id: { in: ids } },
-    select: { id: true, storageKey: true },
-  });
-  if (!documents.length) return [];
-  // Deleting the document removes its page rows too, so anything still queued
-  // simply stops existing. A page already in flight finishes into rows that the
-  // cascade has removed, which Prisma reports and the worker logs as a failed
-  // page for a document nobody is waiting for.
-  await prisma.document.deleteMany({ where: { id: { in: documents.map((document) => document.id) } } });
-  await Promise.all(documents.map((document) => storage.delete(document.storageKey).catch(() => undefined)));
-  return documents.map((document) => document.id);
+  // Removing the document takes its pages with it, so anything still queued
+  // simply stops existing. A page already in flight finishes into a page the
+  // store no longer holds, which `updatePage` ignores.
+  const removed = deleteDocuments(ids);
+  if (!removed.length) return [];
+  await Promise.all(removed.map((document) => storage.delete(document.storageKey).catch(() => undefined)));
+  return removed.map((document) => document.id);
 }
 
 app.get('/api/health', async (_request, response) => {
@@ -174,8 +175,7 @@ app.get('/api/health', async (_request, response) => {
   // the service cannot work without. A broken bucket policy, a wrong region, or
   // an image missing the OCR binary then fails the deploy instead of surfacing
   // on a user's first upload.
-  const [database, storageStatus, ocrEngine, renderer, converter, queue, serverDb] = await Promise.all([
-    prisma.$queryRaw`SELECT 1`.then(() => 'connected' as const).catch(() => 'unavailable' as const),
+  const [storageStatus, ocrEngine, renderer, converter, queue, serverDb] = await Promise.all([
     storage.check(),
     checkOcrEngine(),
     checkRenderer(),
@@ -183,10 +183,13 @@ app.get('/api/health', async (_request, response) => {
     getQueueHealth().catch(() => null),
     checkServerDb(),
   ]);
-  const ok = database === 'connected' && storageStatus.ok && ocrEngine.ok && renderer.ok;
+  const ok = storageStatus.ok && ocrEngine.ok && renderer.ok;
   response.status(ok ? 200 : 503).json({
     ok,
-    database,
+    // The workspace is this process's memory, so there is no database to be
+    // up or down -- what is worth reporting is how much of it is in use, since
+    // that is now bounded by the heap rather than by a disk somewhere else.
+    workspace: { ...storeStats(), retentionLimit: config.maxRetainedDocuments },
     storage: {
       driver: storageStatus.driver,
       ok: storageStatus.ok,
@@ -240,7 +243,7 @@ app.get('/api/health', async (_request, response) => {
         ...(queue.stalled ? {
           warning: config.runWorkerInProcess
             ? 'OCR work is waiting but the in-process worker has not made progress recently. Check the Render log for a preparation or worker crash.'
-            : 'OCR work is waiting but nothing has made progress recently. Check that the separate worker is running, points at this DATABASE_URL, and has the same DO_SPACES_* variables.',
+            : 'OCR work is waiting but nothing has made progress recently. Check the log for a preparation or worker crash.',
         } : {}),
       },
     } : {}),
@@ -301,7 +304,7 @@ app.post('/api/documents/batch', upload.array('files', config.maxBatchFiles), as
     if (failed) {
       const documentIds = outcomes.flatMap((item) => item.document ? [item.document.id] : []);
       const storageKeys = outcomes.flatMap((item) => item.storageKey ? [item.storageKey] : []);
-      if (documentIds.length) await prisma.document.deleteMany({ where: { id: { in: documentIds } } });
+      if (documentIds.length) deleteDocuments(documentIds);
       await Promise.all(storageKeys.map((key) => storage.delete(key).catch(() => undefined)));
       throw failed.error;
     }
@@ -337,24 +340,21 @@ app.post('/api/documents/cancel', async (request, response, next) => {
 app.post('/api/documents/statuses', async (request, response, next) => {
   try {
     const { ids } = documentIdsSchema.parse(request.body);
-    const documents = await prisma.document.findMany({
-      where: { id: { in: ids } },
-      select: {
-        id: true,
-        originalName: true,
-        size: true,
-        pageCount: true,
-        ocrStatus: true,
-        ocrLanguage: true,
-        ocrMode: true,
-        ocrError: true,
-        createdAt: true,
-        highlights: { orderBy: { createdAt: 'asc' } },
-      },
-      orderBy: { createdAt: 'asc' },
-    });
     const progress = await getOcrProgress(ids);
-    response.json({ documents: documents.map((document) => ({ ...document, ocrProgress: progress.get(document.id) ?? null })) });
+    const documents = getDocuments(ids).map((document) => ({
+      id: document.id,
+      originalName: document.originalName,
+      size: document.size,
+      pageCount: document.pageCount,
+      ocrStatus: document.ocrStatus,
+      ocrLanguage: document.ocrLanguage,
+      ocrMode: document.ocrMode,
+      ocrError: document.ocrError,
+      createdAt: document.createdAt,
+      highlights: highlightsOf(document.id),
+      ocrProgress: progress.get(document.id) ?? null,
+    }));
+    response.json({ documents });
   } catch (error) {
     next(error);
   }
@@ -372,12 +372,13 @@ app.post('/api/documents/search', async (request, response, next) => {
 
 app.get('/api/documents/:id', async (request, response, next) => {
   try {
-    const document = await prisma.document.findUnique({
-      where: { id: request.params.id },
-      include: documentInclude,
-    });
+    const document = getDocument(request.params.id);
     if (!document) return response.status(404).json({ error: 'Document not found.' });
-    response.json(document);
+    response.json({
+      ...document,
+      pages: pagesOf(document.id),
+      highlights: highlightsOf(document.id),
+    });
   } catch (error) {
     next(error);
   }
@@ -385,7 +386,7 @@ app.get('/api/documents/:id', async (request, response, next) => {
 
 app.get('/api/documents/:id/file', async (request, response, next) => {
   try {
-    const document = await prisma.document.findUnique({ where: { id: request.params.id } });
+    const document = getDocument(request.params.id);
     if (!document) return response.status(404).json({ error: 'Document not found.' });
     response.type('application/pdf');
     response.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(document.originalName)}`);
@@ -406,7 +407,7 @@ app.get('/api/documents/:id/file', async (request, response, next) => {
 
 app.post('/api/documents/:id/ocr', async (request, response, next) => {
   try {
-    const document = await prisma.document.findUnique({ where: { id: request.params.id } });
+    const document = getDocument(request.params.id);
     if (!document) return response.status(404).json({ error: 'Document not found.' });
     if (document.ocrStatus === 'PROCESSING') return response.status(409).json({ error: 'OCR is already running.' });
     const requestedMode = request.body?.ocrMode == null ? document.ocrMode : String(request.body.ocrMode).toUpperCase();
@@ -421,23 +422,14 @@ app.post('/api/documents/:id/ocr', async (request, response, next) => {
 app.put('/api/documents/:id/highlights', async (request, response, next) => {
   try {
     const payload = highlightListSchema.parse(request.body);
-    const exists = await prisma.document.count({ where: { id: request.params.id } });
-    if (!exists) return response.status(404).json({ error: 'Document not found.' });
-    const highlights = await prisma.$transaction(async (tx) => {
-      await tx.highlight.deleteMany({ where: { documentId: request.params.id } });
-      if (payload.highlights.length) {
-        await tx.highlight.createMany({
-          data: payload.highlights.map(({ id: _id, ...highlight }) => ({
-            ...highlight,
-            documentId: request.params.id,
-          })),
-        });
-      }
-      return tx.highlight.findMany({
-        where: { documentId: request.params.id },
-        orderBy: { createdAt: 'asc' },
-      });
-    });
+    if (!getDocument(request.params.id)) return response.status(404).json({ error: 'Document not found.' });
+    const highlights = replaceAllHighlights(
+      request.params.id,
+      payload.highlights.map(({ id: _id, ...highlight }) => ({
+        ...highlight,
+        documentId: request.params.id,
+      })),
+    );
     response.json({ highlights });
   } catch (error) {
     next(error);
@@ -596,7 +588,6 @@ const server = app.listen(config.port, () => {
 async function shutdown() {
   server.close();
   await stopOcrWorker();
-  await prisma.$disconnect();
 }
 
 process.on('SIGINT', shutdown);

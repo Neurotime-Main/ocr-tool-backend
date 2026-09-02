@@ -1,11 +1,16 @@
 /**
- * Standalone OCR worker entry point.
+ * The standalone worker entry point, kept only to fail clearly.
  *
- * Started by the `markwise-worker` Render service. It shares this image and
- * this codebase with the API but serves no HTTP: it only reads pages off the
- * queue. Scaling recognition is therefore a matter of raising this service's
- * instance count or CPU, with no effect on API latency.
+ * This used to be a second Render service reading pages off a queue in
+ * Postgres. There is no such queue any more: the workspace is the API process's
+ * own memory, so a worker started here would hold an empty one, find nothing to
+ * do, and leave every upload waiting forever -- with nothing in the log saying
+ * why. Refusing to start says it instead.
  */
-import { runWorkerService } from './ocrWorker.js';
-
-await runWorkerService();
+console.error(
+  'The standalone OCR worker no longer exists. Uploads, the page queue and recognised '
+  + 'pages all live in the API process\'s memory, so a separate worker would share none '
+  + 'of them. Run `npm start` (or `npm run dev`) and let the worker run inside the API; '
+  + 'scale recognition with OCR_CONCURRENCY and the container\'s CPU instead.',
+);
+process.exit(1);

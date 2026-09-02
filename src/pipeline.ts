@@ -1,8 +1,6 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import path from 'node:path';
-import type { Prisma } from '@prisma/client';
 import { config, ocrScriptsForLanguage } from './config.js';
-import { prisma } from './db.js';
 import { lineToWords, ocrPool } from './ocrEngine.js';
 import { normalizeForSearch } from './normalize.js';
 import { openPdf, type ExtractedPage, type PdfHandle } from './pdfText.js';
@@ -10,22 +8,63 @@ import { jpegDimensions, renderDpiForPage, renderPageImage } from './render.js';
 import { hasLegacyEncoding } from './reportText.js';
 import { MissingSourceFileError, storage } from './storage.js';
 import { completePage, failPage, refreshDocumentStatus, type ClaimedPage } from './pageQueue.js';
+import { appendPages, deletePages, getDocument, pagesOf, updateDocument, updatePage, type NewPage } from './store.js';
 import { compactWords } from './words.js';
 import type { OcrWord } from './types.js';
 
 const MIN_USABLE_CHARACTERS = 35;
 const MIN_USABLE_WORDS = 6;
-const PAGE_DB_CHUNK = 25;
+const PAGE_CHUNK = 25;
 
-/** Above this share of suspect words, one page's text layer is not trustworthy. */
-const BROKEN_ENCODING_PAGE = 0.003;
+/**
+ * A tuning ratio read from the environment.
+ *
+ * These thresholds trade recognition time against how much garbled text is
+ * allowed into the index, and the right point depends on the corpus, so they
+ * are adjustable without a deploy. An unset or unparseable value keeps the
+ * default; zero is accepted, since it means "always distrust the text layer".
+ */
+function numberFromEnv(value: string | undefined, fallback: number) {
+  // An empty value means "not set", not zero. `Number('')` is 0, so without
+  // this a variable left blank in .env -- which is exactly how an unused knob
+  // is usually written down -- silently becomes the most aggressive setting
+  // there is, sending every page with a single suspect token to the recogniser.
+  if (value === undefined || value.trim() === '') return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+/**
+ * Above this share of suspect words, one page's text layer is not trustworthy.
+ *
+ * Measured over the sample corpus the pages split in two groups, not one: a
+ * masthead or front page set in a broken display font scores 2.5-10.5%, while
+ * an ordinary inside page scores 0-1.6% because its body copy decodes fine and
+ * only a headline or two is wrong. The first release of this check sat at 0.3%,
+ * which put both groups on the wrong side of it: 67 of 72 sample pages were
+ * rasterised and recognised where 2 had been before, and a page needed only a
+ * single suspect token to qualify -- `YouTube` and `BakiBus` are enough, since
+ * an ASCII capital after a lowercase letter is what the detector keys on.
+ *
+ * At 2% the badly broken pages are still caught and the pages whose body text
+ * is sound keep their text layer. The cost is honest: a handful of garbled
+ * headline words per inside page stay garbled in the index. Lower it towards
+ * 0.01 to buy those back with recognition time.
+ */
+const BROKEN_ENCODING_PAGE = numberFromEnv(process.env.OCR_BROKEN_ENCODING_PAGE, 0.02);
 /**
  * A broken font is a property of the document, not of one page. Once this share
  * of pages is clearly affected, the rest are treated as suspect too -- their
  * cleaner-looking text comes from the same font and is wrong in the same way,
  * just with fewer words to give it away.
+ *
+ * Held at half the document rather than a quarter, because that premise is only
+ * sometimes true: in this corpus pages scoring exactly zero sit beside pages
+ * scoring 3%, so the same PDF really does mix a broken display font with a
+ * sound body font. At a quarter the sweep undid the page threshold above and
+ * sent almost every page to OCR anyway.
  */
-const BROKEN_ENCODING_DOCUMENT = 0.25;
+const BROKEN_ENCODING_DOCUMENT = numberFromEnv(process.env.OCR_BROKEN_ENCODING_DOCUMENT, 0.5);
 
 /**
  * Above this share of one-to-three character boxes, a text layer is not split
@@ -66,6 +105,24 @@ export function fragmentedWordRatio(words: { text: string }[]) {
     .filter((length) => length > 0);
   if (lengths.length < FRAGMENTED_MIN_WORDS) return undefined;
   return lengths.filter((length) => length <= 3).length / lengths.length;
+}
+
+/**
+ * Sends already-accepted text pages back to the recognition queue.
+ *
+ * Both document-wide sweeps below do the same thing to a different selection:
+ * a page that passed on its own is stripped of its text-layer result and left
+ * PENDING, so the queue reads it from the raster instead. This runs before
+ * `preparedAt` is set, so the queue only ever sees the final decision.
+ */
+function requeueTextPages(documentId: string, matches: (page: { pageNumber: number }) => boolean) {
+  let count = 0;
+  for (const page of pagesOf(documentId)) {
+    if (page.source !== 'pdf-text' || !matches(page)) continue;
+    updatePage(page.id, { status: 'PENDING', source: 'pending', text: '', searchText: '', words: [] });
+    count += 1;
+  }
+  return count;
 }
 
 /**
@@ -127,7 +184,7 @@ export function embeddedTextIsUsable(page: ExtractedPage) {
  * picture read are left PENDING for the workers to claim.
  */
 export async function prepareDocument(documentId: string, signal: AbortSignal) {
-  const document = await prisma.document.findUnique({ where: { id: documentId } });
+  const document = getDocument(documentId);
   if (!document) return;
 
   const startedAt = Date.now();
@@ -138,10 +195,7 @@ export async function prepareDocument(documentId: string, signal: AbortSignal) {
   let textPages = 0;
   let ocrPages = 0;
   try {
-    await prisma.document.update({
-      where: { id: documentId },
-      data: { ocrStatus: 'PROCESSING', ocrError: null, preparedAt: null },
-    });
+    updateDocument(documentId, { ocrStatus: 'PROCESSING', ocrError: null, preparedAt: null });
     const downloadStartedAt = Date.now();
     const pdfPath = await storage.materialize(document.storageKey, workDir);
     downloadMs = Date.now() - downloadStartedAt;
@@ -151,9 +205,9 @@ export async function prepareDocument(documentId: string, signal: AbortSignal) {
     openMs = Date.now() - openStartedAt;
     const forceOcr = document.ocrMode === 'FORCE_OCR';
 
-    await prisma.document.update({ where: { id: documentId }, data: { pageCount: pdf.pageCount } });
+    updateDocument(documentId, { pageCount: pdf.pageCount });
     // A re-run replaces whatever the previous attempt left behind.
-    await prisma.ocrPage.deleteMany({ where: { documentId } });
+    deletePages(documentId);
 
     // Pages are written as they are read, a chunk at a time, and dropped.
     //
@@ -165,14 +219,14 @@ export async function prepareDocument(documentId: string, signal: AbortSignal) {
     // up as pages taking minutes each, with no obvious culprit, even for
     // documents that never reach the recogniser.
     //
-    // Chunking still costs one statement per twenty-five pages rather than one
-    // per page, which is what matters over a pooled Neon connection.
+    // Appending a chunk at a time also lets progress move while a long PDF is
+    // still being opened, rather than jumping from nothing to everything.
     const encodingRatios: number[] = [];
     const fragmentRatios: number[] = [];
-    let chunk: Prisma.OcrPageCreateManyInput[] = [];
-    const flush = async () => {
+    let chunk: NewPage[] = [];
+    const flush = () => {
       if (!chunk.length) return;
-      await prisma.ocrPage.createMany({ data: chunk });
+      appendPages(documentId, chunk);
       chunk = [];
     };
 
@@ -186,19 +240,18 @@ export async function prepareDocument(documentId: string, signal: AbortSignal) {
       if (usable) textPages += 1;
       else ocrPages += 1;
       chunk.push({
-        documentId,
         pageNumber,
         width: page.width,
         height: page.height,
         source: usable ? 'pdf-text' : 'pending',
         text: usable ? page.text : '',
         searchText: usable ? normalizeForSearch(page.text) : '',
-        words: (usable ? compactWords(page.words) : []) as unknown as Prisma.InputJsonValue,
+        words: usable ? compactWords(page.words) : [],
         status: usable ? 'COMPLETE' : 'PENDING',
       });
-      if (chunk.length >= PAGE_DB_CHUNK) await flush();
+      if (chunk.length >= PAGE_CHUNK) flush();
     }
-    await flush();
+    flush();
 
     // A broken font is a property of the document, so once enough pages are
     // clearly affected the pages that looked clean are re-read from the raster
@@ -216,10 +269,7 @@ export async function prepareDocument(documentId: string, signal: AbortSignal) {
       const suspectPages = encodingRatios
         .map((ratio, index) => (ratio > 0 ? index + 1 : 0))
         .filter((pageNumber) => pageNumber > 0);
-      const { count } = await prisma.ocrPage.updateMany({
-        where: { documentId, source: 'pdf-text', pageNumber: { in: suspectPages } },
-        data: { status: 'PENDING', source: 'pending', text: '', searchText: '', words: [] },
-      });
+      const count = requeueTextPages(documentId, (page) => suspectPages.includes(page.pageNumber));
       if (count) {
         textPages -= count;
         ocrPages += count;
@@ -236,10 +286,7 @@ export async function prepareDocument(documentId: string, signal: AbortSignal) {
     // document whose keyword matches cannot be trusted.
     const fragmentedPages = fragmentRatios.filter((ratio) => ratio > FRAGMENTED_WORDS_PAGE).length;
     if (fragmentRatios.length && fragmentedPages / fragmentRatios.length >= FRAGMENTED_DOCUMENT) {
-      const { count } = await prisma.ocrPage.updateMany({
-        where: { documentId, source: 'pdf-text' },
-        data: { status: 'PENDING', source: 'pending', text: '', searchText: '', words: [] },
-      });
+      const count = requeueTextPages(documentId, () => true);
       if (count) {
         textPages -= count;
         ocrPages += count;
@@ -253,10 +300,7 @@ export async function prepareDocument(documentId: string, signal: AbortSignal) {
     // This is the commit point for preparation. The claim query ignores every
     // page row until this is set, so a deploy midway through chunked inserts
     // can never make a truncated document look complete.
-    await prisma.document.update({
-      where: { id: documentId },
-      data: { preparedAt: new Date() },
-    });
+    updateDocument(documentId, { preparedAt: new Date() });
     await refreshDocumentStatus(documentId);
     console.log(
       `[ocr] prepared document=${documentId} pages=${pdf.pageCount} text=${textPages} ocr=${ocrPages} `
@@ -266,10 +310,7 @@ export async function prepareDocument(documentId: string, signal: AbortSignal) {
   } catch (error) {
     if (signal.aborted) return;
     const message = error instanceof Error ? error.message : 'Unknown failure while opening the document';
-    await prisma.document.update({
-      where: { id: documentId },
-      data: { ocrStatus: 'FAILED', ocrError: message.slice(0, 1000) },
-    }).catch(() => undefined);
+    updateDocument(documentId, { ocrStatus: 'FAILED', ocrError: message.slice(0, 1000) });
     console.error(`[ocr] preparation failed document=${documentId} after ${((Date.now() - startedAt) / 1000).toFixed(2)}s: ${message}`);
   } finally {
     await pdf?.close().catch(() => undefined);
@@ -430,7 +471,7 @@ export async function processPage(page: ClaimedPage, signal: AbortSignal) {
         source: 'ppocr-v5',
         text,
         searchText: normalizeForSearch(text),
-        words: compactWords(words) as unknown as Prisma.InputJsonValue,
+        words: compactWords(words),
       });
       const storeMs = Date.now() - storeStartedAt;
       console.log(

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { prisma } from './db.js';
+import { getDocument, highlightsOf, pagesOf, replaceAutoHighlights } from './store.js';
 import { normalizeForSearch, normalizeToken } from './normalize.js';
 import { cleanReportText } from './reportText.js';
 import type { HighlightInput, OcrWord } from './types.js';
@@ -200,49 +200,23 @@ export async function searchDocuments(documentIds: string[], keywords: string[])
     return documentIds.map((documentId) => ({ documentId, highlights: [] }));
   }
 
-  const candidates = await prisma.ocrPage.findMany({
-    where: {
-      documentId: { in: documentIds },
-      status: 'COMPLETE',
-      OR: [
-        ...needles.map((needle) => ({ searchText: { contains: needle } })),
-        // Pages stored before `searchText` existed carry the empty string, so
-        // they cannot be ruled out here and are matched in full below. The
-        // worker backfills them, after which this branch selects nothing.
-        { searchText: '' },
-      ],
-    },
-    select: { documentId: true, pageNumber: true, words: true },
-    orderBy: [{ documentId: 'asc' }, { pageNumber: 'asc' }],
-  });
+  // The cheap filter first: a page whose normalised text holds none of the
+  // needles cannot produce a match, and ruling it out here avoids walking its
+  // word boxes. A page with no searchText at all cannot be ruled out, so it is
+  // matched in full.
+  const matchesNeedle = (searchText: string) =>
+    !searchText || needles.some((needle) => searchText.includes(needle));
 
-  const byDocument = new Map<string, typeof candidates>();
-  for (const page of candidates) {
-    const list = byDocument.get(page.documentId) ?? [];
-    list.push(page);
-    byDocument.set(page.documentId, list);
-  }
-
-  // Documents are written one at a time rather than in parallel: each is a
-  // delete-then-insert of its automatic highlights, and a pooled Neon
-  // connection is happier with a queue of small transactions than with thirty
-  // at once.
   const results: Array<{ documentId: string; highlights: unknown[] }> = [];
   for (const documentId of documentIds) {
-    const document = await prisma.document.findUnique({
-      where: { id: documentId },
-      select: { id: true, ocrStatus: true },
-    });
+    const document = getDocument(documentId);
     if (!document || document.ocrStatus === 'PENDING') continue;
 
-    const automatic = (byDocument.get(documentId) ?? [])
+    const automatic = pagesOf(documentId)
+      .filter((page) => page.status === 'COMPLETE' && matchesNeedle(page.searchText))
       .flatMap((page) => findPageMatches(page, keywords, documentId));
-    const highlights = await prisma.$transaction(async (tx) => {
-      await tx.highlight.deleteMany({ where: { documentId, source: 'AUTO' } });
-      if (automatic.length) await tx.highlight.createMany({ data: automatic });
-      return tx.highlight.findMany({ where: { documentId }, orderBy: { createdAt: 'asc' } });
-    });
-    results.push({ documentId, highlights });
+    // Manual marks are the operator's own work and survive every re-search.
+    results.push({ documentId, highlights: replaceAutoHighlights(documentId, automatic) });
   }
   return results;
 }
@@ -318,23 +292,19 @@ function findingDetails(words: OcrWord[], highlight: StoredHighlight, pageText: 
 export async function buildStoredFindings(documentIds: string[]): Promise<ReportFinding[]> {
   const findings: ReportFinding[] = [];
   for (const documentId of documentIds) {
-    const document = await prisma.document.findUnique({
-      where: { id: documentId },
-      select: {
-        originalName: true,
-        highlights: { where: { source: 'AUTO' }, orderBy: [{ pageNumber: 'asc' }, { createdAt: 'asc' }] },
-      },
-    });
-    if (!document?.highlights.length) continue;
+    const document = getDocument(documentId);
+    if (!document) continue;
+    const automatic = highlightsOf(documentId)
+      .filter((highlight) => highlight.source === 'AUTO')
+      .sort((a, b) => a.pageNumber - b.pageNumber || a.createdAt.getTime() - b.createdAt.getTime());
+    if (!automatic.length) continue;
 
-    const pageNumbers = [...new Set(document.highlights.map((highlight) => highlight.pageNumber))];
-    const pageRows = await prisma.ocrPage.findMany({
-      where: { documentId, pageNumber: { in: pageNumbers } },
-      select: { pageNumber: true, words: true, text: true },
-    });
-    const pages = new Map(pageRows.map((page) => [page.pageNumber, { words: page.words as OcrWord[], text: page.text }]));
+    const pageNumbers = new Set(automatic.map((highlight) => highlight.pageNumber));
+    const pages = new Map(pagesOf(documentId)
+      .filter((page) => pageNumbers.has(page.pageNumber))
+      .map((page) => [page.pageNumber, { words: page.words as OcrWord[], text: page.text }]));
 
-    for (const highlight of document.highlights) {
+    for (const highlight of automatic) {
       const page = pages.get(highlight.pageNumber);
       const details = findingDetails(page?.words ?? [], highlight as StoredHighlight, page?.text ?? '');
       findings.push({

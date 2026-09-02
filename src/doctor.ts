@@ -11,7 +11,6 @@
 import { access } from 'node:fs/promises';
 import path from 'node:path';
 import { config, describeRuntime, isSpacesDriver } from './config.js';
-import { prisma } from './db.js';
 import { checkOcrEngine } from './ocrEngine.js';
 import { checkRenderer } from './render.js';
 import { checkConverter, checkImageConverter } from './convert.js';
@@ -32,21 +31,12 @@ const inProduction = process.env.NODE_ENV === 'production';
 console.log(describeRuntime(config.runWorkerInProcess ? 'api' : 'worker'));
 console.log('');
 
-// --- Database -------------------------------------------------------------
-try {
-  await prisma.$queryRaw`SELECT 1`;
-  add('Database connection', true, 'connected');
-  try {
-    const pages = await prisma.ocrPage.count();
-    add('Database schema', true, `OcrPage reachable (${pages} page rows)`);
-  } catch (error) {
-    add('Database schema', false, (error as Error).message.split('\n')[0] ?? 'query failed',
-      'Run `npx prisma migrate deploy`. The page queue needs the 20260828000000_page_queue migration.');
-  }
-} catch (error) {
-  add('Database connection', false, (error as Error).message.split('\n')[0] ?? 'unreachable',
-    'Check DATABASE_URL. It should be the Neon POOLED string (host contains "-pooler") with ?sslmode=require.');
-}
+// --- Workspace ------------------------------------------------------------
+// There is no database to check. The workspace is this process's memory, so
+// what matters is that the operator knows it does not survive a restart.
+add('Workspace', true,
+  `in memory, up to ${config.maxRetainedDocuments} documents`,
+  'Uploads and recognised pages are lost on restart. Publish a batch before redeploying.');
 
 // --- Storage --------------------------------------------------------------
 const storageStatus = await storage.check();
@@ -170,5 +160,4 @@ if (failures.length) {
   console.log(`Everything needed is in place. Uploads will be processed.${warnings.length ? ` (${warnings.length} warning(s) above.)` : ''}`);
 }
 
-await prisma.$disconnect();
 process.exit(failures.length ? 1 : 0);

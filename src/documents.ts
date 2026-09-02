@@ -1,4 +1,6 @@
-import { prisma } from './db.js';
+import {
+  allDocuments, deleteAutoHighlights, deletePages, pagesOf, updateDocument,
+} from './store.js';
 
 export type OcrProgress = {
   currentPage: number;
@@ -7,58 +9,35 @@ export type OcrProgress = {
 };
 
 /**
- * Progress for a batch of documents, derived from their page rows.
+ * Progress for a batch of documents, derived from their pages.
  *
- * This used to be a counter held in the API process, which meant it only ever
- * described work that this process happened to be running: after a restart, or
- * with the worker in its own service, it had nothing to report. Counting
- * finished pages instead is accurate from any process, survives a deploy, and
- * is what the pipeline is actually doing.
- *
- * One grouped query answers the whole batch, so polling thirty documents costs
- * one round trip rather than thirty.
+ * Counting finished pages rather than keeping a separate counter means the
+ * number is always what the pipeline is actually doing, and a page that has run
+ * out of retries counts as finished -- so progress reaches the end instead of
+ * stalling one short of it.
  */
 export async function getOcrProgress(documentIds: string[]) {
   const progress = new Map<string, OcrProgress | null>();
   if (!documentIds.length) return progress;
 
-  const counts = await prisma.ocrPage.groupBy({
-    by: ['documentId', 'status'],
-    where: { documentId: { in: documentIds } },
-    _count: { _all: true },
-  });
-
-  const totals = new Map<string, { done: number; total: number }>();
-  for (const row of counts) {
-    const entry = totals.get(row.documentId) ?? { done: 0, total: 0 };
-    entry.total += row._count._all;
-    // A page that has run out of retries is finished as far as the batch is
-    // concerned, so progress reaches the end instead of stalling one short.
-    if (row.status === 'COMPLETE' || row.status === 'FAILED') entry.done += row._count._all;
-    totals.set(row.documentId, entry);
-  }
-
   // Documents with no pages yet have not been opened, so they are reported by
-  // their position in the queue -- which tells the user the server is alive and
-  // what it is waiting for.
-  const unprepared = documentIds.filter((id) => !totals.has(id));
-  const queue = unprepared.length
-    ? await prisma.document.findMany({
-      where: { ocrStatus: { in: ['PENDING', 'PROCESSING'] }, pages: { none: {} } },
-      select: { id: true },
-      orderBy: { createdAt: 'asc' },
-    })
-    : [];
+  // their position in the queue -- which tells the operator the server is alive
+  // and what it is waiting for.
+  const waiting = allDocuments()
+    .filter((document) => (document.ocrStatus === 'PENDING' || document.ocrStatus === 'PROCESSING')
+      && pagesOf(document.id).length === 0)
+    .map((document) => document.id);
 
   for (const documentId of documentIds) {
-    const entry = totals.get(documentId);
-    if (entry) {
-      progress.set(documentId, entry.done >= entry.total
+    const pages = pagesOf(documentId);
+    if (pages.length) {
+      const done = pages.filter((page) => page.status === 'COMPLETE' || page.status === 'FAILED').length;
+      progress.set(documentId, done >= pages.length
         ? null
-        : { currentPage: entry.done, totalPages: entry.total });
+        : { currentPage: done, totalPages: pages.length });
       continue;
     }
-    const position = queue.findIndex((document) => document.id === documentId);
+    const position = waiting.indexOf(documentId);
     progress.set(documentId, position === -1
       ? null
       : { currentPage: 0, totalPages: 0, queuePosition: position + 1 });
@@ -74,12 +53,13 @@ export async function getOcrProgress(documentIds: string[]) {
  * The worker notices a document with no pages and prepares it again.
  */
 export async function requeueDocument(documentId: string, ocrMode: string) {
-  await prisma.$transaction([
-    prisma.ocrPage.deleteMany({ where: { documentId } }),
-    prisma.highlight.deleteMany({ where: { documentId, source: 'AUTO' } }),
-    prisma.document.update({
-      where: { id: documentId },
-      data: { ocrStatus: 'PENDING', ocrError: null, ocrMode, pageCount: null, preparedAt: null },
-    }),
-  ]);
+  deletePages(documentId);
+  deleteAutoHighlights(documentId);
+  updateDocument(documentId, {
+    ocrStatus: 'PENDING',
+    ocrError: null,
+    ocrMode,
+    pageCount: null,
+    preparedAt: null,
+  });
 }
