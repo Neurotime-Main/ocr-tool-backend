@@ -44,6 +44,12 @@ export type DocumentRow = {
   /** Set only once every page has been enumerated. The queue ignores a document until then. */
   preparedAt: Date | null;
   ocrError: string | null;
+  /**
+   * True once the uploaded PDF has been deleted because the document was
+   * published. The recognised text and the highlights are still here; only the
+   * file is gone, so the viewer has to say so rather than fail.
+   */
+  sourceRemoved: boolean;
   createdAt: Date;
   updatedAt: Date;
 };
@@ -113,6 +119,7 @@ export function createDocument(input: {
     ocrMode: input.ocrMode,
     preparedAt: null,
     ocrError: null,
+    sourceRemoved: false,
     createdAt: now,
     updatedAt: now,
   };

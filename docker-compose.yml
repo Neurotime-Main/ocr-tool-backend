@@ -1,14 +1,80 @@
-services:
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: ocr_highlighter
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-    ports:
-      - "5432:5432"
-    volumes:
-      - ocr_postgres_data:/var/lib/postgresql/data
+# Running the API on your own server.
+#
+# One service. There is no database to run beside it: documents, the page queue
+# and the recognised text live in this process's memory, and the only things
+# that outlive a run are written elsewhere -- published images to the Space, and
+# published rows to the Neurotime database. This file used to start a Postgres
+# for the application's own data; that data no longer exists.
+#
+#   cp .env.example .env.production   and fill in the secrets
+#   docker compose up -d --build
+#   curl localhost:4000/api/health
+#
+# Recreating the container wipes uploads and any batch in progress, so deploy
+# between batches rather than during one.
 
-volumes:
-  ocr_postgres_data:
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: markwise-api
+    container_name: markwise-api
+    restart: unless-stopped
+
+    # Secrets and per-deployment settings. Keep this file off the image and out
+    # of git -- it holds the Spaces keys and the Neurotime password.
+    env_file:
+      - .env.production
+
+    # These override anything env_file might carry, because they describe the
+    # container rather than the deployment. A .env copied from a developer's
+    # machine usually names that machine's virtualenv in PYTHON_BIN, which
+    # inside the container points at nothing and stops every page with a dead
+    # recogniser.
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      PYTHON_BIN: /opt/ocr-venv/bin/python
+      PPOCR_MODEL_DIR: /app/models
+      STORAGE_DIR: /app/storage
+      TEMP_DIR: /app/tmp
+      # Uploads stay on the container's own disk. 'spaces' would put them in
+      # the bucket, where a restart leaves them with no document referencing
+      # them -- the Space is for published images only.
+      STORAGE_DRIVER: local
+
+    ports:
+      # Bound to localhost: TLS and the upload size limit belong to the reverse
+      # proxy in front of this, not here.
+      - "127.0.0.1:4000:4000"
+
+    # Uploads and page rasters are working files. They are deliberately not on a
+    # volume: a recreated container should start with an empty workspace,
+    # because the documents that referred to those files are gone with it.
+    tmpfs:
+      - /app/tmp:size=2g
+
+    # Sizing. The recogniser is CPU bound and holds its models in memory, and
+    # the app reads these limits from cgroup to decide how many pages to run at
+    # once -- so setting them here is how you tune throughput, not just how you
+    # cap it. Four cores and 8 GB runs two pages at a time comfortably.
+    cpus: 4
+    mem_limit: 8g
+
+    healthcheck:
+      # The same endpoint a human would check: it reports the Space, the
+      # recogniser, the rasteriser and LibreOffice, and fails if any is unusable.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      # Cold start loads the recognition models, so the first check must not be
+      # taken as a failure.
+      start_period: 90s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
 import { applyLegacyEncodings, detectLegacyEncodings } from './reportText.js';
 import type { OcrWord } from './types.js';
+import { widthPrefix } from './glyphWidth.js';
 
 type PdfTextItem = {
   str: string;
@@ -121,42 +122,15 @@ function repairPageWords(words: OcrWord[]) {
 }
 
 /**
- * Roughly how wide a character is, relative to the others around it.
- *
  * A PDF text item gives one width for the whole run, so a run holding several
  * words has to be divided up to place each of them. Dividing by character count
  * treats `i` and `W` as equals, and on this corpus 85% of words come from such
  * runs -- so the error is not a corner case, it is most of the page. It also
  * accumulates left to right, which is why a highlight tended to sit to the left
- * of the word it belonged to.
- *
- * These are approximate advance widths for a proportional face, not the
- * document's real metrics -- pdf.js does not expose those through
- * `getTextContent`. Being approximately right about every character beats being
- * exactly wrong about all of them.
+ * of the word it belonged to. `widthPrefix` divides it by actual glyph widths
+ * instead; pdf.js does not expose the document's own metrics through
+ * `getTextContent`, so those are approximations shared with `azerbaijani`.
  */
-const NARROW_CHARACTERS = new Set([...`ijlI.,;:!|'\`ı()[]{}/\\-`]);
-const WIDE_CHARACTERS = new Set([...'mwMW@%']);
-
-function characterWidth(character: string) {
-  if (character === ' ') return 0.26;
-  if (NARROW_CHARACTERS.has(character)) return 0.30;
-  if (WIDE_CHARACTERS.has(character)) return 0.88;
-  if (character >= '0' && character <= '9') return 0.55;
-  if (/\p{Lu}/u.test(character)) return 0.68;
-  return 0.52;
-}
-
-/** Cumulative width up to each index, so a slice of the run can be measured. */
-function widthPrefix(text: string) {
-  // Indexed by UTF-16 unit, matching what `matchAll` reports, so a surrogate
-  // pair is charged as two halves rather than shifting every later position.
-  const prefix = new Float64Array(text.length + 1);
-  for (let index = 0; index < text.length; index += 1) {
-    prefix[index + 1] = prefix[index]! + characterWidth(text[index]!);
-  }
-  return prefix;
-}
 
 function readPageWords(viewport: any, pageNumber: number, content: any) {
   const words: OcrWord[] = [];

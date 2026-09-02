@@ -388,6 +388,15 @@ app.get('/api/documents/:id/file', async (request, response, next) => {
   try {
     const document = getDocument(request.params.id);
     if (!document) return response.status(404).json({ error: 'Document not found.' });
+    // Publishing removes the upload once its images and rows are safely
+    // written. The recognised text and the highlights are still here, so this
+    // says what happened rather than failing as a missing file.
+    if (document.sourceRemoved) {
+      return response.status(410).json({
+        error: 'This document has been published, and its PDF was removed. '
+          + 'The extracted text and highlights are still available; upload the file again to view its pages.',
+      });
+    }
     response.type('application/pdf');
     response.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(document.originalName)}`);
     // The stored PDF never changes once uploaded -- a re-run replaces the pages,
@@ -410,6 +419,11 @@ app.post('/api/documents/:id/ocr', async (request, response, next) => {
     const document = getDocument(request.params.id);
     if (!document) return response.status(404).json({ error: 'Document not found.' });
     if (document.ocrStatus === 'PROCESSING') return response.status(409).json({ error: 'OCR is already running.' });
+    if (document.sourceRemoved) {
+      return response.status(410).json({
+        error: 'This document has been published and its PDF was removed, so it cannot be read again. Upload the file to re-run OCR.',
+      });
+    }
     const requestedMode = request.body?.ocrMode == null ? document.ocrMode : String(request.body.ocrMode).toUpperCase();
     if (!['AUTO', 'FORCE_OCR'].includes(requestedMode)) return response.status(400).json({ error: `Unsupported OCR mode: ${requestedMode}` });
     await requeueDocument(document.id, requestedMode);

@@ -2,6 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { config, ocrScriptsForLanguage } from './config.js';
 import { lineToWords, ocrPool } from './ocrEngine.js';
+import { repairRecognizedLines } from './azerbaijani.js';
 import { normalizeForSearch } from './normalize.js';
 import { openPdf, type ExtractedPage, type PdfHandle } from './pdfText.js';
 import { jpegDimensions, renderDpiForPage, renderPageImage } from './render.js';
@@ -458,7 +459,10 @@ export async function processPage(page: ClaimedPage, signal: AbortSignal) {
       // raster actually holds would only cost time.
       const maxSide = Math.min(config.ocrDetectionMaxSide, Math.max(imageWidth, imageHeight));
       const recognizeStartedAt = Date.now();
-      const lines = await ocrPool().run(imagePath, maxSide, ocrScriptsForLanguage(page.ocrLanguage), signal);
+      const lines = repairRecognizedLines(
+        await ocrPool().run(imagePath, maxSide, ocrScriptsForLanguage(page.ocrLanguage), signal),
+        page.ocrLanguage,
+      );
       const recognizeMs = Date.now() - recognizeStartedAt;
 
       const words: OcrWord[] = lines.flatMap((line, index) => lineToWords(line, page.pageNumber, index));

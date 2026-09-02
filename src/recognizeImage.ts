@@ -3,6 +3,7 @@ import path from 'node:path';
 import sharp from 'sharp';
 import { config, ocrScriptsForLanguage } from './config.js';
 import { ocrPool, type RecognizedLine } from './ocrEngine.js';
+import { repairRecognizedLines } from './azerbaijani.js';
 
 /**
  * Reading one image and returning its text, with nothing else attached.
@@ -54,13 +55,44 @@ export type RecognizedImage = {
  * words of one line rarely share a pixel-exact top edge. Half the line's height
  * is the usual rule and holds up on these images.
  */
-function inReadingOrder(lines: RecognizedLine[]) {
-  return [...lines].sort((a, b) => {
-    const [, aTop, , aHeight] = a.box;
-    const [, bTop, , bHeight] = b.box;
-    const sameRow = Math.abs((aTop + aHeight / 2) - (bTop + bHeight / 2)) < Math.max(aHeight, bHeight) / 2;
-    return sameRow ? a.box[0] - b.box[0] : aTop - bTop;
-  });
+/**
+ * Groups the detected boxes into the rows a reader would see.
+ *
+ * The detector finds boxes, not sentences: a single line of a poster often
+ * arrives as three separate boxes, and a caption laid over an image can arrive
+ * as a dozen. Emitting one output line per box turns an ordinary sentence into
+ * a column of fragments, which is most of why extracted captions read as
+ * gibberish even when every word in them is right.
+ *
+ * So boxes whose vertical centres sit within half a line height of each other
+ * are one row, ordered left to right and joined with a space; rows are ordered
+ * top to bottom. Grouping is done by walking the boxes in vertical order rather
+ * than by a comparator, because "same row" is not transitive -- a chain of
+ * boxes each slightly lower than the last would sort inconsistently.
+ */
+function intoRows(lines: RecognizedLine[]) {
+  const byTop = [...lines].sort((a, b) => (a.box[1] + a.box[3] / 2) - (b.box[1] + b.box[3] / 2));
+  const rows: RecognizedLine[][] = [];
+  let current: RecognizedLine[] = [];
+  let anchor = 0;
+  let anchorHeight = 0;
+
+  for (const line of byTop) {
+    const centre = line.box[1] + line.box[3] / 2;
+    const height = Math.max(line.box[3], 1e-6);
+    if (current.length && Math.abs(centre - anchor) > Math.max(anchorHeight, height) / 2) {
+      rows.push(current);
+      current = [];
+    }
+    if (!current.length) {
+      anchor = centre;
+      anchorHeight = height;
+    }
+    current.push(line);
+  }
+  if (current.length) rows.push(current);
+
+  return rows.map((row) => [...row].sort((a, b) => a.box[0] - b.box[0]));
 }
 
 export class ImageRecognitionError extends Error {
@@ -124,16 +156,17 @@ export async function recognizeImageFile(
     const { target, width, height } = await normalise(sourcePath, workDir, originalName);
     // Asking the detector for more than the picture holds only costs time.
     const maxSide = Math.min(config.ocrDetectionMaxSide, Math.max(width, height));
-    const lines: RecognizedLine[] = await ocrPool().run(
-      target,
-      maxSide,
-      ocrScriptsForLanguage(languages),
-      signal,
+    // The Latin model cannot emit a lowercase schwa, so Azerbaijani comes back
+    // with its commonest letter missing until this puts it back.
+    const lines: RecognizedLine[] = repairRecognizedLines(
+      await ocrPool().run(target, maxSide, ocrScriptsForLanguage(languages), signal),
+      languages,
     );
 
-    const ordered = inReadingOrder(lines);
-    const text = ordered
-      .map((line) => line.text.trim())
+    const rows = intoRows(lines);
+    const ordered = rows.flat();
+    const text = rows
+      .map((row) => row.map((line) => line.text.trim()).filter(Boolean).join(' '))
       .filter(Boolean)
       .join('\n');
     return {
