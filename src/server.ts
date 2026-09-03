@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { mkdir, rm, stat, unlink } from 'node:fs/promises';
 import {
@@ -77,8 +78,32 @@ app.use(express.json({ limit: '10mb' }));
 
 const uploadDir = path.join(config.tempDir, 'uploads');
 await mkdir(uploadDir, { recursive: true });
+
+/**
+ * Where multer parks an upload while the request is read.
+ *
+ * The directory is created per request rather than only at boot, because it can
+ * stop existing under a running process: TEMP_DIR is a scratch area, and a
+ * tmpfs mount, a cleaner, or someone reclaiming disk takes it away without
+ * warning. Multer then fails with a bare `ENOENT ... open .../uploads/<hash>`,
+ * which reads as a lost file rather than a missing directory and sends whoever
+ * sees it looking in the wrong place -- it cost a scraping run to work out.
+ *
+ * `recursive: true` makes this a no-op in the normal case.
+ */
+const storage_ = multer.diskStorage({
+  destination(_request, _file, callback) {
+    mkdir(uploadDir, { recursive: true })
+      .then(() => callback(null, uploadDir))
+      .catch((error: Error) => callback(error, uploadDir));
+  },
+  filename(_request, _file, callback) {
+    callback(null, randomUUID().replace(/-/g, ''));
+  },
+});
+
 const upload = multer({
-  dest: uploadDir,
+  storage: storage_,
   limits: { fileSize: config.maxUploadBytes, files: config.maxBatchFiles },
   fileFilter: (_request, file, callback) => {
     if (!isAcceptedUpload(file.originalname, file.mimetype)) {
