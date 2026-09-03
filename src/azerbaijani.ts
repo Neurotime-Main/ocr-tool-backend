@@ -172,6 +172,39 @@ export function restoreSchwa(text: string, charOffsets?: number[]): SchwaRepair 
 }
 
 /**
+ * Undoes the breve-for-umlaut misreading.
+ *
+ * `ğ` and `ü` differ by the mark over the letter, and the recogniser confuses
+ * the two: `mümkün` comes back as `mğmkğn`. The rest of the word is right, so
+ * nothing else notices.
+ *
+ * A `ğ` wedged between two consonants is what gives it away. Azerbaijani builds
+ * every syllable around a vowel, so that sequence cannot occur -- measured over
+ * 151,712 words of the sample corpus it appears once, inside a word that was
+ * itself garbled by a broken font, and no word at all lacks a vowel.
+ *
+ * The looser rule is not safe and was measured before being dropped: `ğ` after a
+ * consonant is ordinary Azerbaijani, in `başlanğıcı`, `vurğulayıb`, `işğal` and
+ * 374 more places in the same corpus. It is only the consonant on *both* sides
+ * that is impossible.
+ *
+ * `ö` read as `ü` -- `ödəniş` as `üdəniş` -- is the same class of error and is
+ * left alone, because both spellings are legal Azerbaijani in that position and
+ * nothing in the writing system says which was meant.
+ */
+function repairBreveForUmlaut(text: string) {
+  const characters = [...text];
+  const isVowelOrBoundary = (character: string | undefined) =>
+    character === undefined || !isLetter(character) || VOWELS.has(character);
+  for (let index = 0; index < characters.length; index += 1) {
+    if (characters[index] !== 'ğ' && characters[index] !== 'Ğ') continue;
+    if (isVowelOrBoundary(characters[index - 1]) || isVowelOrBoundary(characters[index + 1])) continue;
+    characters[index] = characters[index] === 'Ğ' ? 'Ü' : 'ü';
+  }
+  return characters.join('');
+}
+
+/**
  * Puts the vowel back into a word that lost the only one it had.
  *
  * A schwa at the edge of a word cannot be found by measuring: the recogniser
@@ -221,7 +254,7 @@ export function repairRecognizedLines<T extends { text: string; charOffsets?: nu
   if (!needsSchwaRepair(languages)) return lines;
   return lines.map((line) => {
     const repaired = restoreSchwa(line.text, line.charOffsets);
-    const text = restoreLoneConsonants(repaired.text);
+    const text = restoreLoneConsonants(repairBreveForUmlaut(repaired.text));
     if (text === line.text) return line;
     // The offsets no longer line up once a lone consonant grows a letter, and
     // nothing downstream needs them after this point, so they are dropped

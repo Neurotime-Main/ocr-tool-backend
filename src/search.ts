@@ -248,6 +248,37 @@ function fallbackTitleFromPageText(pageText: string) {
     .find((line) => line.length >= 3 && /\p{L}/u.test(line)) ?? '';
 }
 
+/**
+ * Splits a line at the gaps between columns.
+ *
+ * `groupWordsIntoLines` groups by vertical position alone, so on a page set in
+ * columns the words at one height across the whole sheet arrive as a single
+ * line. That is harmless for matching, which only ever looks at word boxes, but
+ * a title taken from such a line reads as three unrelated headings run together
+ * -- `sindaElxanfovqelade Cahangirve selahiyyetli...` is two columns of body
+ * text meeting in the middle.
+ *
+ * A gutter is far wider than a word space, so the two separate cleanly: anything
+ * past two and a half times the line's own text height is a column break.
+ */
+function segmentAtGutters(line: OcrWord[]) {
+  const ordered = [...line].sort((a, b) => a.x - b.x);
+  const height = ordered.reduce((sum, word) => sum + word.height, 0) / Math.max(ordered.length, 1);
+  const gutter = Math.max(height * 2.5, 0.02);
+  const runs: OcrWord[][] = [];
+  let current: OcrWord[] = [];
+  for (const word of ordered) {
+    const previous = current[current.length - 1];
+    if (previous && word.x - (previous.x + previous.width) > gutter) {
+      runs.push(current);
+      current = [];
+    }
+    current.push(word);
+  }
+  if (current.length) runs.push(current);
+  return runs;
+}
+
 function findingDetails(words: OcrWord[], highlight: StoredHighlight, pageText: string) {
   const lines = groupWordsIntoLines(words);
   const matchedWords = words.filter((word) => overlap(word, highlight) > 0).sort((a, b) => a.y - b.y || a.x - b.x);
@@ -257,24 +288,106 @@ function findingDetails(words: OcrWord[], highlight: StoredHighlight, pageText: 
   const context = lines.slice(Math.max(0, matchLineIndex - 1), matchLineIndex + 2).map(lineText).filter(Boolean).join(' ').slice(0, 4000);
   const heights = words.map((word) => word.height).filter(Boolean).sort((a, b) => a - b);
   const median = heights[Math.floor(heights.length / 2)] ?? 0.015;
-  const headings = lines.map((line, index) => {
-    const text = lineText(line);
-    const bottom = Math.max(...line.map((word) => word.y + word.height));
-    const height = line.reduce((sum, word) => sum + word.height, 0) / line.length;
-    const distance = highlight.y - bottom;
-    return { index, text, bottom, height, distance };
-  }).filter((line) => line.index < matchLineIndex && line.bottom <= highlight.y + .01 && line.distance <= .35
+
+  // What counts as "bigger" is measured against the text the mention itself sits
+  // in, not against the page. A mention inside a headline should not take the
+  // line beside it as its title, and one inside a caption should not take the
+  // body text above it -- both are the same size as their own surroundings.
+  const matchedLine = lines[matchLineIndex] ?? [];
+  const matchedHeight = matchedLine.length
+    ? matchedLine.reduce((sum, word) => sum + word.height, 0) / matchedLine.length
+    : median;
+  const baseline = Math.max(median, matchedHeight);
+
+  // A heading belongs to the column it sits over. On a broadsheet the nearest
+  // larger line by vertical distance alone is regularly in the next column,
+  // where it titles something else entirely, so the two have to overlap
+  // horizontally before the distance is worth comparing.
+  const highlightLeft = highlight.x;
+  const highlightRight = highlight.x + highlight.width;
+  const sharesColumn = (left: number, right: number) =>
+    Math.min(right, highlightRight) - Math.max(left, highlightLeft) > 0;
+
+  const candidates = lines.flatMap((line, index) => segmentAtGutters(line).map((run) => {
+    const text = lineText(run);
+    const bottom = Math.max(...run.map((word) => word.y + word.height));
+    const height = run.reduce((sum, word) => sum + word.height, 0) / run.length;
+    const left = Math.min(...run.map((word) => word.x));
+    const right = Math.max(...run.map((word) => word.x + word.width));
+    return { index, text, bottom, height, left, right, distance: highlight.y - bottom };
+  })).filter((line) => line.index < matchLineIndex
+    && line.bottom <= highlight.y + .01
+    && line.distance <= .35
     && line.text.length >= 3 && line.text.length <= 250
-    && (line.height >= median * 1.16 || line.text === line.text.toLocaleUpperCase()))
-    .sort((a, b) => b.height - a.height || a.distance - b.distance);
+    // Rules and ornaments -- `***`, a row of dashes -- sit above a section and
+    // are larger than the body, so they qualify on every other test.
+    && (line.text.match(/\p{L}/gu)?.length ?? 0) >= 3
+    // The running head. A full-width strip across the very top carrying the
+    // masthead, the date and the folio is page furniture, not the title of
+    // anything on it -- and for a mention in the first paragraph it is the
+    // nearest larger line there is.
+    && !(line.bottom < .06 && line.right - line.left > .55)
+    // Bigger than what the mention sits in, or set in capitals, which is how a
+    // kicker or a section label is marked when it is not also larger.
+    && (line.height >= baseline * 1.16 || line.text === line.text.toLocaleUpperCase()));
+
+  // Closest first. Sorting by size instead -- which this did -- always returned
+  // the largest thing within a third of a page above the mention, and on a
+  // newspaper that is the masthead or the lead headline rather than the title of
+  // the piece the mention is actually in.
+  const byNearest = (a: typeof candidates[number], b: typeof candidates[number]) =>
+    a.distance - b.distance || b.height - a.height;
+  const inColumn = candidates.filter((line) => sharesColumn(line.left, line.right)).sort(byNearest);
+  const headings = inColumn.length ? inColumn : [...candidates].sort(byNearest);
+
+  /**
+   * Grows the chosen heading into the whole heading.
+   *
+   * A headline is set over two or three lines as often as one, and taking only
+   * the run the mention happened to sit under returns a fragment: `Təyyarədə də
+   * POS terminalla` without the `ödəniş etmək mümkün olacaq` that finishes it.
+   *
+   * The rest of it is recognisable by being the same thing continued -- set at
+   * the same size, over the same column, with no more space between the lines
+   * than a heading leaves between its own. Body text fails all three: it is
+   * smaller, and the gap down to it from the heading is larger than the gap
+   * inside one.
+   */
+  const wholeHeading = (chosen: typeof candidates[number]) => {
+    const parts = candidates.filter((line) =>
+      Math.abs(line.height - chosen.height) <= chosen.height * 0.18
+      && Math.min(line.right, chosen.right) - Math.max(line.left, chosen.left) > 0);
+    const ordered = [...parts].sort((a, b) => a.bottom - b.bottom);
+    const at = ordered.findIndex((line) => line === chosen);
+    if (at < 0) return chosen.text;
+
+    // One line of leading is the most a heading puts between its own lines.
+    const leading = chosen.height * 1.9;
+    const block = [chosen];
+    for (let i = at - 1; i >= 0; i -= 1) {
+      if (ordered[i + 1]!.bottom - ordered[i]!.bottom > leading) break;
+      block.unshift(ordered[i]!);
+    }
+    for (let i = at + 1; i < ordered.length; i += 1) {
+      if (ordered[i]!.bottom - ordered[i - 1]!.bottom > leading) break;
+      block.push(ordered[i]!);
+    }
+    return block.map((line) => line.text).join(' ').slice(0, 250);
+  };
+
+  // Last resort, and deliberately the page's own title: the largest line in the
+  // top of the page. Used only when nothing above the mention qualifies -- a
+  // mention in the first paragraph of a page has no section heading over it, and
+  // naming the page beats naming nothing.
   const fallback = lines.map((line) => ({
     text: lineText(line),
     top: Math.min(...line.map((word) => word.y)),
     height: Math.max(...line.map((word) => word.height)),
   })).filter((line) => line.top < .4 && line.text.length >= 3 && line.text.length <= 250 && line.height >= median * 1.2)
     .sort((a, b) => b.height - a.height || a.top - b.top)[0];
+
   return {
-    title: headings[0]?.text ?? fallback?.text ?? fallbackTitleFromPageText(pageText),
+    title: (headings[0] && wholeHeading(headings[0])) ?? fallback?.text ?? fallbackTitleFromPageText(pageText),
     matchedText: lineText(matchedWords).slice(0, 1000),
     context,
     confidence: matchedWords.length ? matchedWords.reduce((sum, word) => sum + word.confidence, 0) / matchedWords.length : null,
