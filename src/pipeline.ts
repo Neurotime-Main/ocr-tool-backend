@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { config, ocrScriptsForLanguage } from './config.js';
 import { lineToWords, ocrPool } from './ocrEngine.js';
@@ -12,6 +12,8 @@ import { completePage, failPage, refreshDocumentStatus, type ClaimedPage } from 
 import { appendPages, deletePages, getDocument, pagesOf, updateDocument, updatePage, type NewPage } from './store.js';
 import { compactWords } from './words.js';
 import type { OcrWord } from './types.js';
+import { extractVideoFrames, imagesToPdfDirectory } from './convert.js';
+import { normaliseImageForOcr, recognizePreparedImage } from './recognizeImage.js';
 
 const MIN_USABLE_CHARACTERS = 35;
 const MIN_USABLE_WORDS = 6;
@@ -177,6 +179,120 @@ export function embeddedTextIsUsable(page: ExtractedPage) {
 }
 
 /**
+ * Reads images and video frames directly, before creating any PDF.
+ *
+ * PDF is produced only after recognition because the existing viewer and media
+ * publishing code need a stable paged asset. It is therefore packaging, not an
+ * OCR input conversion, and the recogniser sees the original prepared pixels.
+ */
+async function prepareVisualMedia(
+  document: NonNullable<ReturnType<typeof getDocument>>,
+  sourcePath: string,
+  workDir: string,
+  signal: AbortSignal,
+) {
+  const visualDir = path.join(workDir, 'visual');
+  await mkdir(visualDir);
+
+  let imagePaths: string[];
+  let frameIntervalSeconds: number | null = null;
+  let externalWorkDir: string | undefined;
+  let imageSize: { width: number; height: number } | undefined;
+
+  try {
+    if (document.mediaKind === 'video') {
+      const extracted = await extractVideoFrames(sourcePath, document.originalName);
+      externalWorkDir = extracted.workDir;
+      imagePaths = extracted.frames;
+      frameIntervalSeconds = extracted.frameIntervalSeconds;
+    } else {
+      const prepared = await normaliseImageForOcr(sourcePath, visualDir, document.originalName);
+      imagePaths = [prepared.target];
+      imageSize = { width: prepared.width, height: prepared.height };
+    }
+
+    if (signal.aborted) return;
+    updateDocument(document.id, { pageCount: imagePaths.length });
+    deletePages(document.id);
+
+    // FFmpeg emits one fixed-size stream, so reading metadata from thousands of
+    // frames would only create avoidable file-descriptor pressure.
+    const firstDimensions = imageSize ?? await jpegDimensions(imagePaths[0]!);
+    const dimensions = imagePaths.map(() => firstDimensions);
+    const rows = appendPages(document.id, imagePaths.map((_, index) => ({
+      pageNumber: index + 1,
+      width: dimensions[index]!.width,
+      height: dimensions[index]!.height,
+      source: 'pending',
+      text: '',
+      searchText: '',
+      words: [],
+      status: 'PENDING' as const,
+    })));
+
+    // A small fixed worker set bounds both memory and the Paddle daemon queue,
+    // even for hour-long videos with thousands of sampled frames.
+    let nextIndex = 0;
+    const workerCount = Math.min(config.ocrConcurrency, imagePaths.length);
+    await Promise.all(Array.from({ length: workerCount }, async () => {
+      while (true) {
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= imagePaths.length || signal.aborted) return;
+        const page = rows[index]!;
+        const { width, height } = dimensions[index]!;
+        updatePage(page.id, { status: 'PROCESSING', attempts: 1, startedAt: new Date() });
+        try {
+          const result = await recognizePreparedImage(
+            imagePaths[index]!, width, height, document.ocrLanguage, signal,
+          );
+          const words = result.lines.flatMap((line, lineIndex) =>
+            lineToWords(line, index + 1, lineIndex));
+          updatePage(page.id, {
+            status: 'COMPLETE',
+            source: document.mediaKind === 'video' ? 'ppocr-v5-video' : 'ppocr-v5-image',
+            text: result.text,
+            searchText: normalizeForSearch(result.text),
+            words: compactWords(words),
+            error: null,
+            lockedBy: null,
+          });
+        } catch (error) {
+          if (signal.aborted) return;
+          updatePage(page.id, {
+            status: 'FAILED',
+            error: (error instanceof Error ? error.message : 'Image recognition failed').slice(0, 1000),
+            lockedBy: null,
+          });
+        }
+      }
+    }));
+    if (signal.aborted) return;
+
+    // Package the exact images OCR saw so highlights share the same geometry.
+    const packageDir = document.mediaKind === 'video' ? path.dirname(imagePaths[0]!) : visualDir;
+    const viewerPdf = path.join(workDir, 'viewer.pdf');
+    await imagesToPdfDirectory(packageDir, viewerPdf);
+    const newStorageKey = await storage.saveTemporaryFile(viewerPdf, {
+      extension: '.pdf', contentType: 'application/pdf',
+    });
+    const originalStorageKey = document.storageKey;
+    updateDocument(document.id, {
+      storageKey: newStorageKey,
+      frameIntervalSeconds,
+      visualSourcePrepared: true,
+      preparedAt: new Date(),
+    });
+    await storage.delete(originalStorageKey).catch(() => undefined);
+    await refreshDocumentStatus(document.id);
+  } finally {
+    if (externalWorkDir) {
+      await rm(externalWorkDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+}
+
+/**
  * Creates the page rows for a newly uploaded document.
  *
  * Every page that can be served from the text layer is written finished in this
@@ -201,6 +317,14 @@ export async function prepareDocument(documentId: string, signal: AbortSignal) {
     const pdfPath = await storage.materialize(document.storageKey, workDir);
     downloadMs = Date.now() - downloadStartedAt;
     if (signal.aborted) return;
+    if ((document.mediaKind === 'image' || document.mediaKind === 'video') && !document.visualSourcePrepared) {
+      await prepareVisualMedia(document, pdfPath, workDir, signal);
+      console.log(
+        `[ocr] prepared ${document.mediaKind} document=${documentId} `
+        + `total=${((Date.now() - startedAt) / 1000).toFixed(2)}s direct-image-ocr=true`,
+      );
+      return;
+    }
     const openStartedAt = Date.now();
     pdf = await openPdf(pdfPath);
     openMs = Date.now() - openStartedAt;

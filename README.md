@@ -9,7 +9,7 @@ Standalone Node.js/Express backend for batch OCR processing, highlight persisten
 - **DigitalOcean Spaces (`ams3`):** private storage for uploaded source PDFs, reached through the S3 SDK. Render's filesystem holds only temporary page images.
 - **PaddleOCR PP-OCRv5** on ONNX Runtime, in a Python daemon beside the worker. The models ship inside the image, so no page ever leaves the container.
 
-The batch API accepts up to 30 PDFs per request. Source files are persisted to Spaces with four bounded parallel uploads by default (`UPLOAD_STORAGE_CONCURRENCY`). `MAX_BATCH_FILES` controls the upload count and each file is limited independently by `MAX_UPLOAD_MB`.
+The batch API accepts up to 30 PDFs, office documents, images, or videos per request. Source files are persisted to Spaces with four bounded parallel uploads by default (`UPLOAD_STORAGE_CONCURRENCY`). `MAX_BATCH_FILES` controls the upload count and each file is limited independently by `MAX_UPLOAD_MB`.
 
 ## How a document is processed
 
@@ -59,6 +59,21 @@ Recognition is CPU bound and each page uses one core, so **pages in parallel is 
 | `OCR_STALE_LOCK_MS` | `600000` | How long a claimed page may be silent before another worker may take it. |
 | `OCR_MAX_RETAINED_DOCUMENTS` | `200` | How many documents stay in memory before the oldest finished ones are dropped, taking their stored PDFs with them. This is what bounds the heap. |
 
+Images are rotated, flattened onto white, size-capped, and sent directly to
+PaddleOCR as high-quality 4:4:4 JPEG pixels. Videos are sampled at exactly one
+frame per second and each frame follows the same direct-image path. Only after
+OCR are those images packaged into an internal PDF for the existing viewer and
+publisher, so PDF conversion cannot reduce OCR input quality. A video exceeding
+`VIDEO_MAX_FRAMES=3600` is rejected rather than silently skipping more seconds.
+Video extraction is serialized by default so an upload burst cannot run several
+FFmpeg processes beside PaddleOCR and starve it. `GET /api/documents/:id/text`
+returns timestamped segments and removes exact repeated lines.
+
+Real PDFs stay PDFs: reliable embedded text is used immediately, while scanned
+or damaged pages are rendered to images for OCR. Word, Excel, PowerPoint and
+OpenDocument files first go through LibreOffice because PDF preserves their
+pages, fonts and layout more reliably than inventing one giant image.
+
 The upload form accepts Azerbaijani, English, and Russian independently. English and Azerbaijani use the shared Latin recognizer; Russian uses PaddleOCR's Cyrillic PP-OCRv5 recognizer. When Latin and Russian are both selected, each detected line is tested with both relevant recognizers and the higher-confidence result is kept, so mixed-script pages take longer than one-script pages.
 
 **Automatic** first reads a PDF's embedded text layer and sends only scanned or unusable pages to PaddleOCR. It is the normal, fast choice. **Complex layouts** forces image OCR for every page. Use it when selecting/copying text from a PDF is garbled, missing, or ordered incorrectly because of fonts, columns, or graphic layouts; it is slower because even good text-layer pages are rasterized and recognized.
@@ -102,8 +117,25 @@ Excel reports include the PDF filename, page number, inferred article/page title
 | **Python 3** | Runs the PaddleOCR recognition daemon | Docker image; locally `apt-get install python3 python3-venv` |
 | **PaddleOCR models** (~21 MB) | Latin and Cyrillic recognition weights | Downloaded at image build; locally `npm run setup:python` |
 
-Nothing else. There is no OCR service to sign up for and no API key: every page
-is read inside your own container.
+Nothing else. There is no third-party OCR service or model API key: every page
+is read inside your own container. `OCR_SERVICE_API_KEY` is only your optional
+shared secret for authenticating scraper requests.
+
+### Shared-service API
+
+`GET /api/capabilities` reports the live formats, limits, languages, endpoints,
+and video sampling policy so other applications do not need to hard-code them.
+
+For scraper images, send `multipart/form-data` to `POST /api/ocr/image` with the
+file field named `image`, optional `languages=aze+eng+rus`, and (when configured)
+`X-API-Key: <OCR_SERVICE_API_KEY>`. The synchronous response contains full
+ordered `text`, detected `lines` with confidence and normalized boxes,
+`wordCount`, image dimensions, and processing time. Nothing is persisted.
+
+Documents and videos use the asynchronous API: upload with
+`POST /api/documents/batch`, poll `POST /api/documents/statuses`, then read
+`GET /api/documents/:id/text`. That final response contains page segments for
+documents and timestamped, de-duplicated frame segments for video.
 
 ### Why Python at all
 
@@ -155,6 +187,7 @@ the queue, and prints the exact command that fixes whatever is broken.
 | Variable | Value | Required |
 | --- | --- | --- |
 | `CLIENT_ORIGIN` | your Vercel origin, comma-separated for several | yes |
+| `OCR_SERVICE_API_KEY` | shared secret sent by scraper clients as `X-API-Key` | recommended |
 | `STORAGE_DRIVER` | `spaces` | yes |
 | `DO_SPACES_BUCKET` | the Space name alone, no URL | yes |
 | `DO_SPACES_ENDPOINT` | `https://ams3.digitaloceanspaces.com` | yes |
@@ -163,7 +196,9 @@ the queue, and prints the exact command that fixes whatever is broken.
 | `DO_SPACES_PREFIX` | `documents` | no |
 | `DO_SPACES_FORCE_PATH_STYLE` | `true` | no |
 | `DO_SPACES_DISABLE_CHECKSUMS` | `true` — Spaces rejects the SDK's chunked framing | no |
-| `MAX_BATCH_FILES` / `MAX_UPLOAD_MB` | `30` / `50` | no |
+| `MAX_BATCH_FILES` / `MAX_UPLOAD_MB` | `30` / `250` | no |
+| `IMAGE_MAX_EDGE` / `IMAGE_JPEG_QUALITY` | `4000` / `94` | no |
+| `VIDEO_FRAME_INTERVAL_SECONDS` / `VIDEO_MAX_FRAMES` | `1` / `3600` | no |
 | `OCR_CONCURRENCY` | pages at once; defaults to whole cgroup CPU quota, memory-capped | no |
 | `OCR_QUEUE_NAMESPACE` | `production` on Render, `development` locally; now only a label in the boot line | no |
 | `PPOCR_DET_MAX_SIDE` | `1600`; lower to `1280` for ~⅓ faster, less small text | no |

@@ -3,7 +3,7 @@ import cors from 'cors';
 import multer from 'multer';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
-import { mkdir, rm, stat, unlink } from 'node:fs/promises';
+import { mkdir, rm, unlink } from 'node:fs/promises';
 import {
   assertRuntimeEnvironment, config, describeRuntime, OCR_LANGUAGE_CODES, parseOcrLanguages,
   serializeOcrLanguages, type OcrLanguageCode,
@@ -24,8 +24,8 @@ import { ensureWorkerDirectories, startOcrWorker, stopOcrWorker } from './ocrWor
 import { getOcrProgress, requeueDocument } from './documents.js';
 import { getQueueHealth } from './pageQueue.js';
 import {
-  ACCEPTED_EXTENSIONS, checkConverter, convertToPdf, imageToPdf, isAcceptedUpload, isImageUpload,
-  needsConversion, pdfNameFor,
+  ACCEPTED_EXTENSIONS, checkConverter, checkImageConverter, checkVideoConverter, convertToPdf, isAcceptedUpload,
+  isImageUpload, isVideoUpload, needsConversion,
 } from './convert.js';
 import { fetchNewsKeywords } from './keywords.js';
 import { ImageRecognitionError, recognizeImageFile } from './recognizeImage.js';
@@ -36,9 +36,9 @@ import { searchDocuments } from './search.js';
 
 console.log(describeRuntime('api'));
 await ensureWorkerDirectories();
-// In production the recognition worker is its own Render service, so that OCR
-// never takes CPU away from HTTP. Everywhere else it runs here, which keeps
-// local development to a single command.
+// The queue is in this process's memory, so the API and OCR worker intentionally
+// run together. This is one independently deployed OCR service that can serve
+// several client applications, not a separate worker container.
 if (config.runWorkerInProcess) startOcrWorker();
 else {
   console.log(
@@ -117,10 +117,9 @@ const upload = multer({
 /**
  * Turns one uploaded file into a stored document.
  *
- * A Word or spreadsheet upload is converted to PDF first and recorded under the
- * converted name, so the rest of the system -- pages, highlights, published
- * images -- only ever deals with PDFs. The temporary files from both the upload
- * and the conversion are cleaned up whichever way this goes.
+ * Office files become PDFs so their pages can be rendered consistently. Images
+ * and videos stay in their original containers here; background preparation
+ * sends their pixels straight to OCR and only packages a viewer PDF afterwards.
  */
 async function storeUpload(file: Express.Multer.File, options: {
   languages: OcrLanguageCode[];
@@ -128,25 +127,32 @@ async function storeUpload(file: Express.Multer.File, options: {
 }) {
   let sourcePath = file.path;
   let converted: string | undefined;
+  let frameIntervalSeconds: number | null = null;
+  const mediaKind = isVideoUpload(file.originalname, file.mimetype)
+    ? 'video'
+    : isImageUpload(file.originalname, file.mimetype) ? 'image' : 'document';
 
-  if (isImageUpload(file.originalname, file.mimetype)) {
-    // A photograph or scan becomes a one-page PDF at its own resolution.
-    converted = await imageToPdf(file.path, file.originalname);
-    sourcePath = converted;
-  } else if (needsConversion(file.originalname)) {
+  if (needsConversion(file.originalname)) {
     converted = await convertToPdf(file.path, file.originalname);
     sourcePath = converted;
   }
 
   try {
-    const storageKey = await storage.saveTemporaryFile(sourcePath);
-    const { size } = converted ? await stat(converted).catch(() => ({ size: file.size })) : file;
+    // Keep visual media in its original container until background preparation.
+    // Decoding it inside this request would hide progress behind proxy timeouts.
+    const storageKey = await storage.saveTemporaryFile(sourcePath, mediaKind !== 'document'
+      ? { extension: path.extname(file.originalname).toLowerCase() || `.${mediaKind}`, contentType: file.mimetype || 'application/octet-stream' }
+      : { extension: '.pdf', contentType: 'application/pdf' });
     const document = createDocument({
-      originalName: pdfNameFor(file.originalname),
+      // Keep the user-facing original name regardless of internal packaging.
+      originalName: file.originalname,
       storageKey,
-      size,
+      size: file.size,
       ocrLanguage: serializeOcrLanguages(options.languages),
       ocrMode: options.ocrMode,
+      mimeType: file.mimetype || 'application/octet-stream',
+      mediaKind,
+      frameIntervalSeconds,
     });
     // The workspace is memory, so it has to be bounded. Anything dropped here
     // is a finished document well past the retention cap; its PDF goes with it.
@@ -200,15 +206,18 @@ app.get('/api/health', async (_request, response) => {
   // the service cannot work without. A broken bucket policy, a wrong region, or
   // an image missing the OCR binary then fails the deploy instead of surfacing
   // on a user's first upload.
-  const [storageStatus, ocrEngine, renderer, converter, queue, serverDb] = await Promise.all([
+  const [storageStatus, ocrEngine, renderer, converter, imageConverter, videoConverter, queue, serverDb] = await Promise.all([
     storage.check(),
     checkOcrEngine(),
     checkRenderer(),
     checkConverter(),
+    checkImageConverter(),
+    checkVideoConverter(),
     getQueueHealth().catch(() => null),
     checkServerDb(),
   ]);
-  const ok = storageStatus.ok && ocrEngine.ok && renderer.ok;
+  const ok = storageStatus.ok && ocrEngine.ok && renderer.ok
+    && converter.ok && imageConverter.ok && videoConverter.ok;
   response.status(ok ? 200 : 503).json({
     ok,
     // The workspace is this process's memory, so there is no database to be
@@ -228,13 +237,19 @@ app.get('/api/health', async (_request, response) => {
       ok: renderer.ok,
       ...(renderer.ok ? { engine: renderer.detail } : { error: renderer.detail }),
     },
-    // Reported but not part of `ok`: the OCR side of the service works without
-    // it, and failing the health check would take the whole API down when only
-    // keywords and publishing are affected.
-    // Not part of `ok`: PDFs work without it, only office uploads are affected.
+    // All advertised input paths are part of readiness. A deploy missing one
+    // converter should fail before its first user discovers the broken format.
     officeConversion: {
       ok: converter.ok,
       ...(converter.ok ? { engine: converter.detail } : { error: converter.detail }),
+    },
+    viewerPackaging: {
+      ok: imageConverter.ok,
+      ...(imageConverter.ok ? { engine: imageConverter.detail } : { error: imageConverter.detail }),
+    },
+    videoConversion: {
+      ok: videoConverter.ok,
+      ...(videoConverter.ok ? { engine: videoConverter.detail } : { error: videoConverter.detail }),
     },
     neurotimeDb: {
       ok: serverDb.ok,
@@ -272,6 +287,25 @@ app.get('/api/health', async (_request, response) => {
         } : {}),
       },
     } : {}),
+  });
+});
+
+app.get('/api/capabilities', (_request, response) => {
+  response.json({
+    acceptedExtensions: ACCEPTED_EXTENSIONS,
+    languages: OCR_LANGUAGE_CODES,
+    maxFileSizeMb: Math.round(config.maxUploadBytes / 1024 / 1024),
+    maxBatchFiles: config.maxBatchFiles,
+    endpoints: {
+      image: { method: 'POST', path: '/api/ocr/image', synchronous: true, stored: false, apiKeyRequired: Boolean(config.serviceApiKey) },
+      files: { method: 'POST', path: '/api/documents/batch', synchronous: false, stored: true },
+      text: { method: 'GET', path: '/api/documents/:id/text' },
+    },
+    video: {
+      sampleEverySeconds: config.videoFrameIntervalSeconds,
+      maxFrames: config.videoMaxFrames,
+      longVideos: 'rejected when fixed-rate sampling would exceed maxFrames',
+    },
   });
 });
 
@@ -369,6 +403,9 @@ app.post('/api/documents/statuses', async (request, response, next) => {
     const documents = getDocuments(ids).map((document) => ({
       id: document.id,
       originalName: document.originalName,
+      mimeType: document.mimeType,
+      mediaKind: document.mediaKind,
+      frameIntervalSeconds: document.frameIntervalSeconds,
       size: document.size,
       pageCount: document.pageCount,
       ocrStatus: document.ocrStatus,
@@ -409,6 +446,52 @@ app.get('/api/documents/:id', async (request, response, next) => {
   }
 });
 
+/**
+ * A service-friendly text representation of any completed upload.
+ * Video output includes timestamps and a de-duplicated transcript so static
+ * on-screen text is not repeated for every sampled frame.
+ */
+app.get('/api/documents/:id/text', async (request, response, next) => {
+  try {
+    const document = getDocument(request.params.id);
+    if (!document) return response.status(404).json({ error: 'Document not found.' });
+    if (document.ocrStatus !== 'COMPLETE' && document.ocrStatus !== 'FAILED') {
+      return response.status(409).json({ error: 'Text extraction is still processing.', status: document.ocrStatus });
+    }
+    const pages = pagesOf(document.id).filter((page) => page.status === 'COMPLETE');
+    const seenVideoLines = new Set<string>();
+    const segments = pages.map((page) => {
+      const timestampSeconds = document.mediaKind === 'video' && document.frameIntervalSeconds
+        ? (page.pageNumber - 1) * document.frameIntervalSeconds
+        : null;
+      let text = page.text.trim();
+      if (document.mediaKind === 'video') {
+        const unique: string[] = [];
+        for (const line of text.split(/\r?\n/).map((value) => value.trim()).filter(Boolean)) {
+          const key = line.toLocaleLowerCase().replace(/\s+/g, ' ');
+          if (seenVideoLines.has(key)) continue;
+          seenVideoLines.add(key);
+          unique.push(line);
+        }
+        text = unique.join('\n');
+      }
+      return { pageNumber: page.pageNumber, timestampSeconds, text };
+    });
+    response.json({
+      documentId: document.id,
+      originalName: document.originalName,
+      mediaKind: document.mediaKind,
+      status: document.ocrStatus,
+      durationMs: Math.max(0, document.updatedAt.getTime() - document.createdAt.getTime()),
+      text: segments.map((segment) => segment.text).filter(Boolean).join('\n\n'),
+      segments,
+      failedPages: pagesOf(document.id).filter((page) => page.status === 'FAILED').length,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get('/api/documents/:id/file', async (request, response, next) => {
   try {
     const document = getDocument(request.params.id);
@@ -423,7 +506,8 @@ app.get('/api/documents/:id/file', async (request, response, next) => {
       });
     }
     response.type('application/pdf');
-    response.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(document.originalName)}`);
+    const internalPdfName = `${document.originalName.replace(/\.[^.]+$/, '') || 'document'}.pdf`;
+    response.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(internalPdfName)}`);
     // The stored PDF never changes once uploaded -- a re-run replaces the pages,
     // never the file -- so the browser is told it may keep it. Without this the
     // viewer pulls the whole document from object storage again every time the
@@ -476,12 +560,6 @@ app.put('/api/documents/:id/highlights', async (request, response, next) => {
 });
 
 /**
- * Keywords offered for newspapers, with the projects each belongs to.
- *
- * Served from the Neurotime database rather than typed by the operator, so the
- * words searched for are exactly the ones the rest of the platform tracks.
- */
-/**
  * Reads one image and returns its text. Nothing is stored.
  *
  * The other half of this service. Everything above belongs to the document
@@ -498,7 +576,15 @@ app.put('/api/documents/:id/highlights', async (request, response, next) => {
  * POST multipart/form-data with an `image` file, optionally `languages`
  * (default "aze+eng"; accepts "aze+eng+rus" or a comma-separated list).
  */
-app.post('/api/ocr/image', upload.single('image'), async (request, response, next) => {
+const requireServiceApiKey: express.RequestHandler = (request, response, next) => {
+  if (config.serviceApiKey && request.get('x-api-key') !== config.serviceApiKey) {
+    response.status(401).json({ error: 'A valid X-API-Key header is required.' });
+    return;
+  }
+  next();
+};
+
+app.post('/api/ocr/image', requireServiceApiKey, upload.single('image'), async (request, response, next) => {
   const uploadedPath = request.file?.path;
   try {
     if (!request.file) {
@@ -507,7 +593,7 @@ app.post('/api/ocr/image', upload.single('image'), async (request, response, nex
     if (!isImageUpload(request.file.originalname, request.file.mimetype)) {
       return response.status(415).json({
         error: `This endpoint reads images. ${request.file.originalname} is not one; `
-          + 'use POST /api/documents for PDFs and office files.',
+          + 'use POST /api/documents for documents and videos.',
       });
     }
 

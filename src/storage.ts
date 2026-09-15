@@ -1,5 +1,5 @@
 import { createReadStream, createWriteStream } from 'node:fs';
-import { access, mkdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { access, copyFile, mkdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import path from 'node:path';
@@ -11,6 +11,7 @@ import { NodeHttpHandler } from '@smithy/node-http-handler';
 import { config, isSpacesDriver } from './config.js';
 
 export type StorageStatus = { driver: string; ok: boolean; detail: string };
+export type SaveFileOptions = { extension?: string; contentType?: string };
 
 /**
  * The uploaded file is gone and will not come back.
@@ -23,7 +24,7 @@ export class MissingSourceFileError extends Error {
 }
 
 export interface FileStorage {
-  saveTemporaryFile(tempPath: string): Promise<string>;
+  saveTemporaryFile(tempPath: string, options?: SaveFileOptions): Promise<string>;
   materialize(key: string, destinationDir: string): Promise<string>;
   createReadStream(key: string): Promise<Readable>;
   delete(key: string): Promise<void>;
@@ -50,10 +51,18 @@ export interface FileStorage {
 export class LocalFileStorage implements FileStorage {
   constructor(private readonly root: string) {}
 
-  async saveTemporaryFile(tempPath: string) {
+  async saveTemporaryFile(tempPath: string, options: SaveFileOptions = {}) {
     await mkdir(this.root, { recursive: true });
-    const key = `${randomUUID()}.pdf`;
-    await rename(tempPath, this.resolve(key));
+    const extension = /^\.[a-z0-9]{1,8}$/i.test(options.extension ?? '') ? options.extension! : '.pdf';
+    const key = `${randomUUID()}${extension}`;
+    const destination = this.resolve(key);
+    await rename(tempPath, destination).catch(async (error: NodeJS.ErrnoException) => {
+      // A configured storage directory may be a mounted volume while uploads
+      // land on the container filesystem. `rename` cannot cross that boundary.
+      if (error.code !== 'EXDEV') throw error;
+      await copyFile(tempPath, destination);
+      await unlink(tempPath);
+    });
     return key;
   }
 
@@ -145,12 +154,13 @@ export class SpacesFileStorage implements FileStorage {
     });
   }
 
-  private newKey() {
-    return this.prefix ? `${this.prefix}/${randomUUID()}.pdf` : `${randomUUID()}.pdf`;
+  private newKey(extension = '.pdf') {
+    const safeExtension = /^\.[a-z0-9]{1,8}$/i.test(extension) ? extension : '.bin';
+    return this.prefix ? `${this.prefix}/${randomUUID()}${safeExtension}` : `${randomUUID()}${safeExtension}`;
   }
 
-  async saveTemporaryFile(tempPath: string) {
-    const key = this.newKey();
+  async saveTemporaryFile(tempPath: string, options: SaveFileOptions = {}) {
+    const key = this.newKey(options.extension);
     try {
       const { size } = await stat(tempPath);
       await this.client.send(new PutObjectCommand({
@@ -160,7 +170,7 @@ export class SpacesFileStorage implements FileStorage {
         // Spaces rejects a streamed body without a length, and the SDK can only
         // infer one for buffers, so uploads fail intermittently without this.
         ContentLength: size,
-        ContentType: 'application/pdf',
+        ContentType: options.contentType ?? 'application/pdf',
         // Spaces encrypts at rest by itself and rejects the SSE header, so it
         // is sent only where these variables point at a store that wants one.
         ...(config.spaces.serverSideEncryption
@@ -280,8 +290,8 @@ class SourceStorage implements FileStorage {
     return this.local;
   }
 
-  saveTemporaryFile(tempPath: string) {
-    return (this.preferRemote && this.remote ? this.remote : this.local).saveTemporaryFile(tempPath);
+  saveTemporaryFile(tempPath: string, options?: SaveFileOptions) {
+    return (this.preferRemote && this.remote ? this.remote : this.local).saveTemporaryFile(tempPath, options);
   }
 
   materialize(key: string, destinationDir: string) { return this.forKey(key).materialize(key, destinationDir); }

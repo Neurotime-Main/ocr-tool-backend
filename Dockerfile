@@ -18,7 +18,7 @@ FROM node:22-bookworm-slim AS runtime
 # document laid out the way its author saw it.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates curl poppler-utils python3 python3-venv libgomp1 \
+        ca-certificates curl poppler-utils ffmpeg python3 python3-venv libgomp1 \
         libreoffice-writer-nogui libreoffice-calc-nogui libreoffice-impress-nogui \
         fonts-dejavu-core fonts-liberation2 \
     && rm -rf /var/lib/apt/lists/*

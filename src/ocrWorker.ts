@@ -15,10 +15,9 @@ import { storage } from './storage.js';
 /**
  * The page worker.
  *
- * Runs in its own Render service in production, so recognition never competes
- * with HTTP traffic for the CPU, and runs inside the API process during local
- * development so `npm run dev` stays one command. Several instances can run at
- * once without coordinating: the queue hands each page to exactly one of them.
+ * Runs inside the API process in every environment because the queue and
+ * workspace are in memory. All clients share this worker and its bounded OCR
+ * pool, so scraper traffic and frontend batches cannot oversubscribe the host.
  */
 
 type WorkerState = {

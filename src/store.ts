@@ -36,6 +36,11 @@ export type DocumentRow = {
   originalName: string;
   storageKey: string;
   mimeType: string;
+  mediaKind: 'document' | 'image' | 'video';
+  /** Seconds represented by one page when a video was sampled into frames. */
+  frameIntervalSeconds: number | null;
+  /** The original image/video has been replaced by a viewer-ready PDF after direct image OCR. */
+  visualSourcePrepared: boolean;
   size: number;
   pageCount: number | null;
   ocrStatus: OcrStatus;
@@ -105,6 +110,8 @@ export function createDocument(input: {
   ocrLanguage: string;
   ocrMode: string;
   mimeType?: string;
+  mediaKind?: 'document' | 'image' | 'video';
+  frameIntervalSeconds?: number | null;
 }): DocumentRow {
   const now = new Date();
   const document: DocumentRow = {
@@ -112,6 +119,9 @@ export function createDocument(input: {
     originalName: input.originalName,
     storageKey: input.storageKey,
     mimeType: input.mimeType ?? 'application/pdf',
+    mediaKind: input.mediaKind ?? 'document',
+    frameIntervalSeconds: input.frameIntervalSeconds ?? null,
+    visualSourcePrepared: false,
     size: input.size,
     pageCount: null,
     ocrStatus: 'PENDING',

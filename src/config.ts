@@ -116,6 +116,12 @@ function positiveInteger(value: string | undefined, fallback: number, maximum = 
   return Math.min(maximum, Math.floor(parsed));
 }
 
+function positiveNumber(value: string | undefined, fallback: number, maximum = Number.MAX_SAFE_INTEGER) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(maximum, parsed);
+}
+
 /**
  * The share of a CPU this container is actually scheduled for, or Infinity when
  * nothing caps it. `availableParallelism` reports the host's cores, which on a
@@ -242,16 +248,6 @@ const usableMemory = (() => {
 const memoryBoundConcurrency = Math.max(1, Math.floor(usableMemory / WORKER_MEMORY_BUDGET));
 
 /**
- * Whether this process reads the queue itself.
- *
- * Defaults to on, everywhere. Splitting recognition into its own service is the
- * right shape once OCR volume justifies it, but it is a second deployment to
- * keep in step -- same image, same database, same storage credentials -- and
- * getting any of that wrong fails silently, with documents queueing forever or
- * every page reporting a missing file. One service that works beats two that
- * might. Set RUN_OCR_IN_API=false on the API once a dedicated worker exists.
- */
-/**
  * Always true now, and kept as a field only so the boot line and health report
  * still say so. The queue lives in this process's memory, so a worker anywhere
  * else would have nothing to read; RUN_OCR_IN_API=false would simply stop every
@@ -294,6 +290,9 @@ const renderConcurrency = Math.max(1, Math.min(requestedRenderConcurrency, cpuCo
 
 export const config = {
   port: Number(process.env.PORT ?? 4000),
+  // Optional shared secret for server-to-server calls to the stateless image
+  // endpoint. Browser document workflows are deliberately not gated by it.
+  serviceApiKey: process.env.OCR_SERVICE_API_KEY ?? '',
   /**
    * Origins the browser may call this API from.
    *
@@ -389,12 +388,20 @@ export const config = {
   renderJpegQuality: Math.min(100, Math.max(40, positiveInteger(process.env.OCR_JPEG_QUALITY, 88))),
 
   // --- Uploaded images ----------------------------------------------------
-  // A photo or scan is wrapped in a one-page PDF at upload. Anything longer
-  // than this on its longest edge is scaled down first: a 12 MP phone photo of
-  // a page carries no more readable text than a 4000px scan of it, and the
-  // extra pixels are paid for again at every rasterisation.
+  // A photo or scan goes directly to OCR. Anything longer than this on its
+  // longest edge is scaled down first: a 12 MP phone photo of a page carries no
+  // more readable text than a 4000px scan of it.
   imageMaxEdge: positiveInteger(process.env.IMAGE_MAX_EDGE, 4000),
-  imageJpegQuality: Math.min(100, Math.max(40, positiveInteger(process.env.IMAGE_JPEG_QUALITY, 88))),
+  imageJpegQuality: Math.min(100, Math.max(40, positiveInteger(process.env.IMAGE_JPEG_QUALITY, 94))),
+  // Videos use a fixed sampling interval. An upload over the frame cap fails
+  // clearly instead of silently changing that interval or truncating the end.
+  ffmpegBin: process.env.FFMPEG_BIN ?? 'ffmpeg',
+  ffprobeBin: process.env.FFPROBE_BIN ?? 'ffprobe',
+  videoFrameIntervalSeconds: positiveNumber(process.env.VIDEO_FRAME_INTERVAL_SECONDS, 1, 60),
+  videoMaxFrames: positiveInteger(process.env.VIDEO_MAX_FRAMES, 3600, 10_000),
+  videoMaxEdge: positiveInteger(process.env.VIDEO_MAX_EDGE, 1920, 4000),
+  videoConversionConcurrency: positiveInteger(process.env.VIDEO_CONVERSION_CONCURRENCY, 1, 4),
+  videoConversionTimeoutMs: positiveInteger(process.env.VIDEO_CONVERSION_TIMEOUT_MS, 30 * 60_000),
   renderTimeoutMs: positiveInteger(process.env.OCR_RENDER_TIMEOUT_MS, 120_000),
 
   // --- Throughput ---------------------------------------------------------
@@ -506,7 +513,7 @@ export const config = {
   },
 
   uploadStorageConcurrency: positiveInteger(process.env.UPLOAD_STORAGE_CONCURRENCY, 4, 8),
-  maxUploadBytes: Number(process.env.MAX_UPLOAD_MB ?? 50) * 1024 * 1024,
+  maxUploadBytes: Number(process.env.MAX_UPLOAD_MB ?? 250) * 1024 * 1024,
   maxBatchFiles: positiveInteger(process.env.MAX_BATCH_FILES, 30),
 };
 

@@ -70,11 +70,11 @@ add('Office to PDF (LibreOffice)', converter.ok ? 'ok' : 'warn', converter.detai
   converter.ok ? undefined
     : 'Install it with `sudo apt-get install -y libreoffice-writer-nogui` to accept .doc/.docx/.xlsx/.pptx uploads. PDFs are unaffected.');
 
-// --- Image conversion -----------------------------------------------------
-// Also only a warning, for the same reason: it is needed to accept photos and
-// scans, not to process a PDF.
+// --- Viewer packaging -----------------------------------------------------
+// Direct image OCR itself does not need img2pdf; the page viewer and publisher
+// use the packaged document created after recognition.
 const imageConverter = await checkImageConverter();
-add('Image to PDF (img2pdf)', imageConverter.ok ? 'ok' : 'warn', imageConverter.detail,
+add('Visual viewer packaging (img2pdf)', imageConverter.ok ? 'ok' : 'warn', imageConverter.detail,
   imageConverter.ok ? undefined
     : 'Run `npm run setup:python` to accept .jpg/.png/.heic uploads. PDFs are unaffected.');
 

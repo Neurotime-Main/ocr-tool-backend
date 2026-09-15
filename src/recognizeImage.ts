@@ -111,7 +111,7 @@ export class ImageRecognitionError extends Error {
  * black on white, but a post image is as likely to be pale text over a
  * photograph, where the colour channels carry some of the contrast.
  */
-async function normalise(sourcePath: string, workDir: string, originalName: string) {
+export async function normaliseImageForOcr(sourcePath: string, workDir: string, originalName: string) {
   const target = path.join(workDir, 'image.jpg');
   const image = sharp(sourcePath, { limitInputPixels: 512 * 1024 * 1024, animated: false });
 
@@ -131,10 +131,35 @@ async function normalise(sourcePath: string, workDir: string, originalName: stri
       fit: 'inside',
       withoutEnlargement: true,
     })
-    .jpeg({ quality: config.imageJpegQuality, mozjpeg: true })
+    // High-quality 4:4:4 JPEG keeps coloured letter edges intact while being
+    // substantially smaller and faster to move through the worker than PNG.
+    // Paddle still receives pixels, never the JPEG container itself.
+    .jpeg({ quality: Math.max(config.imageJpegQuality, 94), chromaSubsampling: '4:4:4', mozjpeg: true })
     .toFile(target);
 
   return { target, width: info.width, height: info.height };
+}
+
+export async function recognizePreparedImage(
+  imagePath: string,
+  width: number,
+  height: number,
+  languages: string,
+  signal: AbortSignal,
+) {
+  const maxSide = Math.min(config.ocrDetectionMaxSide, Math.max(width, height));
+  const lines = repairRecognizedLines(
+    await ocrPool().run(imagePath, maxSide, ocrScriptsForLanguage(languages), signal),
+    languages,
+  );
+  const rows = intoRows(lines);
+  return {
+    lines: rows.flat(),
+    text: rows
+      .map((row) => row.map((line) => line.text.trim()).filter(Boolean).join(' '))
+      .filter(Boolean)
+      .join('\n'),
+  };
 }
 
 /**
@@ -153,25 +178,11 @@ export async function recognizeImageFile(
   const workDir = await mkdtemp(path.join(config.tempDir, 'recognize-'));
 
   try {
-    const { target, width, height } = await normalise(sourcePath, workDir, originalName);
-    // Asking the detector for more than the picture holds only costs time.
-    const maxSide = Math.min(config.ocrDetectionMaxSide, Math.max(width, height));
-    // The Latin model cannot emit a lowercase schwa, so Azerbaijani comes back
-    // with its commonest letter missing until this puts it back.
-    const lines: RecognizedLine[] = repairRecognizedLines(
-      await ocrPool().run(target, maxSide, ocrScriptsForLanguage(languages), signal),
-      languages,
-    );
-
-    const rows = intoRows(lines);
-    const ordered = rows.flat();
-    const text = rows
-      .map((row) => row.map((line) => line.text.trim()).filter(Boolean).join(' '))
-      .filter(Boolean)
-      .join('\n');
+    const { target, width, height } = await normaliseImageForOcr(sourcePath, workDir, originalName);
+    const { lines, text } = await recognizePreparedImage(target, width, height, languages, signal);
     return {
       text,
-      lines: ordered.map((line) => ({
+      lines: lines.map((line) => ({
         text: line.text,
         confidence: line.confidence,
         box: line.box.map((value) => Number(value.toFixed(5))) as [number, number, number, number],
