@@ -578,6 +578,12 @@ app.put('/api/documents/:id/highlights', async (request, response, next) => {
  */
 const requireServiceApiKey: express.RequestHandler = (request, response, next) => {
   if (config.serviceApiKey && request.get('x-api-key') !== config.serviceApiKey) {
+    console.warn(`[ocr-image] rejected ${JSON.stringify({
+      status: 401,
+      remoteAddress: request.ip || request.socket.remoteAddress || 'unknown',
+      userAgent: request.get('user-agent') ?? null,
+      error: 'Missing or invalid X-API-Key.',
+    })}`);
     response.status(401).json({ error: 'A valid X-API-Key header is required.' });
     return;
   }
@@ -585,12 +591,41 @@ const requireServiceApiKey: express.RequestHandler = (request, response, next) =
 };
 
 app.post('/api/ocr/image', requireServiceApiKey, upload.single('image'), async (request, response, next) => {
+  const requestId = randomUUID();
+  const startedAt = Date.now();
   const uploadedPath = request.file?.path;
+  const requestLog = {
+    requestId,
+    remoteAddress: request.ip || request.socket.remoteAddress || 'unknown',
+    userAgent: request.get('user-agent') ?? null,
+    originalName: request.file?.originalname ?? null,
+    mimeType: request.file?.mimetype ?? null,
+    bytes: request.file?.size ?? 0,
+    requestedLanguages: typeof request.body?.languages === 'string' ? request.body.languages : null,
+  };
+
+  // Keep this as one JSON object per line so Docker/journald logs remain easy
+  // to search. The upload's bytes and API key are deliberately excluded; the
+  // recognised text is logged with the response below for scraper debugging.
+  console.log(`[ocr-image] received ${JSON.stringify(requestLog)}`);
+
   try {
     if (!request.file) {
+      console.warn(`[ocr-image] rejected ${JSON.stringify({
+        requestId,
+        status: 400,
+        durationMs: Date.now() - startedAt,
+        error: 'Missing multipart image field.',
+      })}`);
       return response.status(400).json({ error: 'Attach an image as the "image" field.' });
     }
     if (!isImageUpload(request.file.originalname, request.file.mimetype)) {
+      console.warn(`[ocr-image] rejected ${JSON.stringify({
+        requestId,
+        status: 415,
+        durationMs: Date.now() - startedAt,
+        error: 'Uploaded file is not a supported image.',
+      })}`);
       return response.status(415).json({
         error: `This endpoint reads images. ${request.file.originalname} is not one; `
           + 'use POST /api/documents for documents and videos.',
@@ -600,6 +635,12 @@ app.post('/api/ocr/image', requireServiceApiKey, upload.single('image'), async (
     const requested = typeof request.body?.languages === 'string' ? request.body.languages : undefined;
     const languages = parseOcrLanguages(requested);
     if (requested && !languages) {
+      console.warn(`[ocr-image] rejected ${JSON.stringify({
+        requestId,
+        status: 400,
+        durationMs: Date.now() - startedAt,
+        error: `Unknown OCR languages: ${requested}`,
+      })}`);
       return response.status(400).json({
         error: `Unknown language in "${requested}". Available: ${OCR_LANGUAGE_CODES.join(', ')}.`,
       });
@@ -617,8 +658,20 @@ app.post('/api/ocr/image', requireServiceApiKey, upload.single('image'), async (
       selected,
       controller.signal,
     );
+    console.log(`[ocr-image] completed ${JSON.stringify({
+      requestId,
+      status: 200,
+      durationMs: Date.now() - startedAt,
+      result,
+    })}`);
     response.json(result);
   } catch (error) {
+    console.error(`[ocr-image] failed ${JSON.stringify({
+      requestId,
+      status: error instanceof ImageRecognitionError ? 422 : 500,
+      durationMs: Date.now() - startedAt,
+      error: error instanceof Error ? error.message : String(error),
+    })}`);
     if (error instanceof ImageRecognitionError) {
       return response.status(422).json({ error: error.message });
     }
