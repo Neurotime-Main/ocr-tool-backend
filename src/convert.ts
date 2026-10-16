@@ -234,7 +234,12 @@ export async function imagesToPdfDirectory(imagesDir: string, outputPath: string
     if (!size) throw new ConversionError('The viewer PDF was empty.');
   } catch (error) {
     if (error instanceof ConversionError) throw error;
-    throw new ConversionError(`Could not prepare the viewer document: ${(error as Error).message.split('\n')[0]}`);
+    // The first message line is only "Command failed: <argv>"; the reason is in
+    // stderr, or in the signal when the process was killed (OOM, timeout).
+    const failure = error as Error & { stderr?: string; signal?: string | null };
+    const reason = failure.stderr?.trim().split('\n').pop()
+      || (failure.signal ? `killed by ${failure.signal}` : failure.message.split('\n')[0]);
+    throw new ConversionError(`Could not prepare the viewer document: ${reason}`);
   }
   return outputPath;
 }

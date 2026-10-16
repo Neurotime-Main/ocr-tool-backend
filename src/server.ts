@@ -762,6 +762,7 @@ app.use((error: unknown, _request: express.Request, response: express.Response, 
 const server = app.listen(config.port, () => {
   console.log(`OCR Highlight API listening on http://localhost:${config.port}`);
 });
+server.requestTimeout = config.httpRequestTimeoutMs;
 
 async function shutdown() {
   server.close();

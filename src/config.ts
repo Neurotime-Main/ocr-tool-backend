@@ -290,6 +290,9 @@ const renderConcurrency = Math.max(1, Math.min(requestedRenderConcurrency, cpuCo
 
 export const config = {
   port: Number(process.env.PORT ?? 4000),
+  // Node answers 408 when a request body is not fully received within this
+  // window (its own default is 5 minutes), which long videos can exceed.
+  httpRequestTimeoutMs: positiveInteger(process.env.HTTP_REQUEST_TIMEOUT_MS, 30 * 60_000),
   // Optional shared secret for server-to-server calls to the stateless image
   // endpoint. Browser document workflows are deliberately not gated by it.
   serviceApiKey: process.env.OCR_SERVICE_API_KEY ?? '',
